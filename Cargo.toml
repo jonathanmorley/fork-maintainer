@@ -1,0 +1,17 @@
+[package]
+name = "fork-maintainer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+axum = "0.8.9"
+futures = "0.3.34"
+gix = "0.87.1"
+octocrab = { version = "0.54.1", default-features = false, features = ["rustls", "rustls-webpki-tokio", "retry", "tracing", "rustls-ring", "jwt-rust-crypto"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["full"] }
+tracing = "0.1.44"
+tracing-subscriber = "0.3.23"
