@@ -5,15 +5,27 @@
 //! verifies the HMAC signature and dispatches a reconcile for the affected
 //! fork.
 //!
+//! Alongside the webhook, a background poll loop periodically reconciles every
+//! configured fork so an idle fork still picks up *upstream* drift (the app
+//! cannot subscribe to upstream — webhooks only fire for the repos it is
+//! installed on).
+//!
 //! Configuration comes from `FORK_MAINTAINER_CONFIG` (a JSON file) or
 //! `config.json` in the working directory, or defaults to an empty list of
 //! forks. See [`fork_maintainer::config::AppConfig`].
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use fork_maintainer::config::{AppConfig, ForkConfig};
+use fork_maintainer::poll::{self, PollOutcome};
 use fork_maintainer::webhook::AppState;
+use gix::actor::SignatureRef;
+
+/// The committer identity stamped on recompose commits.
+const COMMITTER: &[u8] =
+    b"fork-maintainer <fork-maintainer@users.noreply.github.com> 1711398853 +0000";
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt().with_target(false).init();
@@ -29,6 +41,10 @@ fn main() -> Result<()> {
         };
         let router = fork_maintainer::webhook::router(state);
 
+        // Background poll loop for upstream drift; runs the webhook server
+        // until it shuts down.
+        let poll_handle = spawn_poll_loop(cfg.clone());
+
         let addr =
             std::env::var("FORK_MAINTAINER_ADDR").unwrap_or_else(|_| "0.0.0.0:3000".to_string());
         let listener = tokio::net::TcpListener::bind(&addr)
@@ -38,8 +54,66 @@ fn main() -> Result<()> {
         axum::serve(listener, router)
             .await
             .context("serve webhook")?;
+
+        poll_handle.abort();
         Ok(())
     })
+}
+
+/// Spawn the background poll loop.
+///
+/// Runs a reconcile pass for every configured fork at a fixed interval
+/// (default 300s, overridable via `FORK_MAINTAINER_POLL_INTERVAL` seconds).
+/// The loop runs until the returned handle is aborted.
+fn spawn_poll_loop(cfg: AppConfig) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let interval = std::env::var("FORK_MAINTAINER_POLL_INTERVAL")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .map(Duration::from_secs)
+            .unwrap_or(Duration::from_secs(300));
+        tracing::info!(seconds = interval.as_secs(), "poll loop started");
+
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            poll_once(&cfg).await;
+        }
+    })
+}
+
+/// Run a single poll pass for all configured forks.
+///
+/// The reconcile itself is blocking git I/O, so it runs on a worker thread via
+/// [`tokio::task::spawn_blocking`]; only the results are logged back on the
+/// async context.
+async fn poll_once(cfg: &AppConfig) {
+    let forks = cfg.forks.clone();
+    let fork_list = forks.clone();
+    let outcomes = tokio::task::spawn_blocking(move || {
+        let committer = SignatureRef::from_bytes(COMMITTER).expect("valid committer");
+        poll::run_pass(&fork_list, |fork| {
+            // Open-PR stack discovery is a follow-up. For now reconcile the
+            // upstream mirror + base artifact, which is what surfaces upstream
+            // drift; the artifact recomposes on the freshly synced base.
+            poll::reconcile_fork(fork, &fork.upstream.https_url(), &[], committer)
+        })
+    })
+    .await
+    .expect("poll blocking task panicked");
+
+    for (fork, outcome) in forks.iter().zip(outcomes) {
+        match outcome {
+            PollOutcome::NoChange => tracing::debug!(fork = %fork.fork, "no upstream drift"),
+            PollOutcome::Changed { note } => {
+                tracing::info!(fork = %fork.fork, %note, "fork reconciled")
+            }
+            PollOutcome::Failed(err) => {
+                tracing::warn!(fork = %fork.fork, "reconcile failed: {err}")
+            }
+        }
+    }
 }
 
 /// Load `AppConfig` from `FORK_MAINTAINER_CONFIG`, falling back to

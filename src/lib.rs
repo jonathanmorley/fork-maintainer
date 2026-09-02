@@ -11,10 +11,15 @@
 //!   release tags.
 //!
 //! The app is event-driven via GitHub webhooks, plus a poll loop for upstream
-//! drift (the app cannot subscribe to upstream, only to forks it is installed
-//! on).
+//! drift. Webhooks fire only for the repositories the app is installed on, so
+//! an install on the *fork* delivers fork-side events (branch/PR activity) —
+//! it does *not* deliver upstream events, even though the fork is in the
+//! upstream's fork network (installs do not cascade across a network). Upstream
+//! drift on an otherwise idle fork is therefore only ever observed by the poll
+//! loop.
 
 pub mod config;
 pub mod engine;
 pub mod github;
+pub mod poll;
 pub mod webhook;

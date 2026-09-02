@@ -20,6 +20,8 @@ Two branches the engine maintains:
 Everything else is derived from the fork's default branch name and the
 upstream repository. An optional `override_upstream_branch` allows
 pointing at an upstream branch whose name differs from the fork's default.
+Each fork also declares `default_branch` (the knob the app maintains, default
+`main`) and `local_mirror` (the local repo the app syncs and recomposes).
 
 ## Status
 
@@ -102,14 +104,37 @@ fork content must live on a stack branch.
       `config.json`), resolve the affected fork and request a reconcile
 - [x] Unit tests (12): signature valid/tampered/wrong-secret, event mapping,
       dispatch outcomes, handler status codes + dispatch invocation
-- [ ] (Not yet) Upstream-drift poll loop (the app cannot subscribe to upstream,
-      only to forks it is installed on)
+- [ ] (Not yet) Wire webhook dispatch to the full engine (install token + local
+      mirror + `reconcile`)
+
+**Milestone 8 — Upstream-drift poll loop** ✅
+
+The app is event-driven for *fork*-side changes (webhooks), but webhooks fire
+only for repositories the app is installed on — an install on the fork never
+surfaces *upstream* activity, even though the fork shares a fork network. So an
+idle fork with no inbound events would never learn that upstream moved. This
+milestone closes that gap with a poll loop.
+
+- [x] `config::ForkConfig`: `default_branch` (the knob) and `local_mirror` (the
+      local repo the app drives); `Repo::https_url()`
+- [x] `poll::PollOutcome`: classify a reconcile as `NoChange` / `Changed` /
+      `Failed`
+- [x] `poll::run_pass`: iterate every fork, isolate per-fork failures (one bad
+      fork never aborts the pass), classify each result
+- [x] `poll::reconcile_fork`: open the configured `local_mirror` and run the
+      engine `reconcile` (sync mirror + compose artifact)
+- [x] `main.rs`: background poll task at a fixed interval (default 300s,
+      `FORK_MAINTAINER_POLL_INTERVAL`), running reconcilies on a worker thread
+      and logging whether anything changed
+- [x] Unit tests (5 + 2 integration): classification of mirror
+      advanced/up-to-date/diverged/error, per-fork error isolation, and
+      `reconcile_fork` end-to-end over local bare repos
 
 **Up next**
 
 - [ ] Stack cascade-rebase (behind `Rebase` trait; gix rebase is "idea" stage)
-- [ ] Upstream-drift poll loop; wire webhook reconcile to the full engine
-      (install token + local mirror + `reconcile`)
+- [ ] Wire webhook reconcile + poll stack to live open-PR discovery (install
+      token + local mirror + discovered stack)
 
 ## Project layout
 
@@ -118,6 +143,7 @@ src/
   lib.rs           — library root
   config.rs        — fork config (upstream, fork, mirror branch derivation)
   webhook.rs       — GitHub webhook signature verification + event dispatch
+  poll.rs          — upstream-drift poll loop (scheduling + outcome classify)
   github/
     mod.rs         — module root + re-exports
     discovery.rs   — open-PR stack discovery (ordering logic) + live PR fetch
@@ -128,7 +154,7 @@ src/
     fetch.rs       — fetch upstream / PR-head refs over the git transport
     stack.rs       — artifact composition (path changes + branch-stack overlay)
     pipeline.rs    — reconcile: config-derived sync + compose in one pass
-  main.rs          — binary: load config, run the webhook server
+  main.rs          — binary: load config, run the webhook server + poll loop
 ```
 
 ## Development

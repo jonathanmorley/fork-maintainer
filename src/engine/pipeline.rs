@@ -51,15 +51,15 @@ pub struct ReconcileOutcome {
 pub fn reconcile(
     repo: &Repository,
     cfg: &ForkConfig,
-    fork_default_branch: &str,
     upstream_url: &str,
     stack: &[String],
     committer: SignatureRef<'_>,
 ) -> Result<ReconcileOutcome> {
-    let branch = cfg.upstream_branch(fork_default_branch);
-    let mirror_ref = format!("refs/heads/{}", cfg.mirror_branch(fork_default_branch));
-    let track_ref = format!("refs/remotes/{}", cfg.mirror_branch(fork_default_branch));
-    let artifact_ref = format!("refs/heads/{fork_default_branch}");
+    let branch = cfg.upstream_branch();
+    let artifact = cfg.default_branch.clone();
+    let mirror_ref = format!("refs/heads/{}", cfg.mirror_branch());
+    let track_ref = format!("refs/remotes/{}", cfg.mirror_branch());
+    let artifact_ref = format!("refs/heads/{artifact}");
 
     // 1. Sync the upstream mirror.
     let sync = sync_mirror(repo, upstream_url, &branch, &mirror_ref, &track_ref)?;
@@ -150,6 +150,8 @@ mod tests {
                 owner: "myorg".into(),
                 name: "terraform-provider-github".into(),
             },
+            default_branch: "main".into(),
+            local_mirror: None,
             override_upstream_branch: None,
         }
     }
@@ -171,7 +173,6 @@ mod tests {
         let first = reconcile(
             &fork,
             &cfg(),
-            "main",
             &upstream_dir.display().to_string(),
             &stack,
             sig(),
@@ -219,7 +220,6 @@ mod tests {
         let outcome = reconcile(
             &fork,
             &cfg(),
-            "main",
             &upstream_dir.display().to_string(),
             &stack,
             sig(),
@@ -265,7 +265,6 @@ mod tests {
         let outcome = reconcile(
             &fork,
             &cfg,
-            "main",
             &upstream_dir.display().to_string(),
             &stack,
             sig(),
@@ -331,7 +330,6 @@ mod tests {
         let outcome = reconcile(
             &fork,
             &cfg(),
-            "main",
             &upstream_dir.display().to_string(),
             &stack,
             sig(),
