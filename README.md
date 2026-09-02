@@ -28,12 +28,18 @@ pointing at an upstream branch whose name differs from the fork's default.
 - [x] Fast-forward detection (gix `merge_base` + is_ancestor check)
 - [x] Fetch upstream over the git transport (`engine::fetch`, `file://` in tests)
 - [x] End-to-end mirror sync (`engine::sync::sync_mirror`: fetch + fast-forward)
-- [x] Local bare-repo tests for FF, up-to-date, diverged history, and fetch
+
+**Milestone 2 — Tree composition (artifact half)** ✅ (fork-owned preserve)
+
+- [x] Fork-owned file detection (`engine::compose::fork_owned_files`)
+- [x] Artifact recomposition (`engine::compose::compose_artifact`): overlay fork-owned
+      files onto a new upstream base
+- [x] Local bare-repo tests for detection and preservation
 
 **Up next**
 
-- [ ] Tree composition / artifact building
-- [ ] Stack discovery and cascade-rebase (behind `Rebase` trait; gix rebase is "idea" stage)
+- [ ] Patch stack discovery and overlay onto the artifact
+- [ ] Stack cascade-rebase (behind `Rebase` trait; gix rebase is "idea" stage)
 - [ ] GitHub App wiring (webhooks, installation tokens)
 
 ## Project layout
@@ -47,6 +53,7 @@ src/
     mod.rs       — git engine root
     sync.rs      — fast-forward mirror ref + sync_mirror orchestration
     fetch.rs     — fetch upstream over the git transport (remote/explicit refspec)
+    compose.rs   — fork-owned file detection + artifact tree composition
 ```
 
 ## Development
