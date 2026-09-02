@@ -12,4 +12,5 @@
 //!   owned files. Hosts fork workflows and release tags. *(composition is a
 //!   later milestone — this module currently focuses on branch syncing)*
 
+pub mod fetch;
 pub mod sync;

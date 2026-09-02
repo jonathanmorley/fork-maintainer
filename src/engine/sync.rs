@@ -83,6 +83,39 @@ pub fn fast_forward(
     Ok(outcome)
 }
 
+/// The combined result of syncing a mirror ref from upstream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncResult {
+    /// The upstream tip that was fetched.
+    pub tip: gix::ObjectId,
+    /// Whether / how the mirror ref was moved.
+    pub ff: FfOutcome,
+}
+
+/// Fetch `branch` from the upstream repository and fast-forward the mirror ref
+/// `mirror_ref` to the fetched tip.
+///
+/// This is the milestone-2 end-to-end mirror sync: it pulls the upstream
+/// repository into the fork's object store, then moves the `upstream/<X>`
+/// mirror ref only if the move is a strict fast-forward.
+///
+/// `upstream` is either an HTTPS URL (production) or a local path / `file://`
+/// URL (tests). Fetching writes into the tracking ref `track_ref` (e.g.
+/// `refs/remotes/upstream/main`); the mirror ref is advanced by
+/// [`fast_forward`]. Wraps [`crate::engine::fetch::fetch_upstream`], which is
+/// blocking — call from a worker thread in async contexts.
+pub fn sync_mirror(
+    repo: &Repository,
+    upstream: &str,
+    branch: &str,
+    mirror_ref: &str,
+    track_ref: &str,
+) -> anyhow::Result<SyncResult> {
+    let tip = crate::engine::fetch::fetch_upstream(repo, upstream, branch, track_ref)?;
+    let ff = fast_forward(repo, mirror_ref, tip.oid)?;
+    Ok(SyncResult { tip: tip.oid, ff })
+}
+
 /// Write `target` onto the reference named `ref_name`, recording a reflog.
 fn write_ref(
     repo: &Repository,
@@ -134,6 +167,7 @@ mod tests {
     use super::*;
     use gix::actor::SignatureRef;
     use gix::objs::tree::EntryKind;
+    use gix::refs::transaction::PreviousValue;
     use std::path::Path;
 
     /// Create an empty, bare git repository at `path` and return the opened repo.
@@ -166,7 +200,7 @@ mod tests {
         let commit = repo
             .new_commit_as(sig(), sig(), message, tree_id, parent)
             .expect("new commit");
-        commit.id.into()
+        commit.id
     }
 
     /// Return the ObjectId the given ref currently points to, or None.
@@ -237,5 +271,63 @@ mod tests {
 
         assert!(matches!(outcome, FfOutcome::NotFastForward { .. }));
         assert_eq!(ref_id(&repo, "refs/heads/upstream/main"), Some(c1));
+    }
+
+    #[test]
+    fn sync_mirror_creates_then_advances_mirror() {
+        // Upstream with an initial commit on `main`.
+        let upstream_dir = temp_dir("sync_upstream");
+        let upstream = init_bare(&upstream_dir);
+        let c1 = commit_with_file(&upstream, "a.txt", "one", "one", None);
+        let c2 = commit_with_file(&upstream, "a.txt", "two", "two", Some(c1));
+        upstream
+            .reference("refs/heads/main", c1, PreviousValue::Any, "init upstream branch")
+            .expect("create upstream main");
+
+        let fork_dir = temp_dir("sync_fork");
+        let fork = init_bare(&fork_dir);
+
+        // First sync: no mirror ref yet -> created.
+        let first = sync_mirror(
+            &fork,
+            &upstream_dir.display().to_string(),
+            "main",
+            "refs/heads/upstream/main",
+            "refs/remotes/upstream/main",
+        )
+        .expect("first sync");
+        assert_eq!(first.tip, c1);
+        assert!(matches!(first.ff, FfOutcome::FastForwarded { .. }));
+        assert_eq!(ref_id(&fork, "refs/heads/upstream/main"), Some(c1));
+
+        // Upstream advances main to c2.
+        upstream
+            .reference("refs/heads/main", c2, PreviousValue::ExistingMustMatch(gix::refs::Target::Object(c1)), "advance upstream main")
+            .expect("advance upstream main");
+
+        // Second sync: mirror is fast-forwarded c1 -> c2.
+        let second = sync_mirror(
+            &fork,
+            &upstream_dir.display().to_string(),
+            "main",
+            "refs/heads/upstream/main",
+            "refs/remotes/upstream/main",
+        )
+        .expect("second sync");
+        assert_eq!(second.tip, c2);
+        assert!(matches!(second.ff, FfOutcome::FastForwarded { .. }));
+        assert_eq!(ref_id(&fork, "refs/heads/upstream/main"), Some(c2));
+
+        // Third sync: nothing changed -> up to date.
+        let third = sync_mirror(
+            &fork,
+            &upstream_dir.display().to_string(),
+            "main",
+            "refs/heads/upstream/main",
+            "refs/remotes/upstream/main",
+        )
+        .expect("third sync");
+        assert_eq!(third.tip, c2);
+        assert_eq!(third.ff, FfOutcome::UpToDate);
     }
 }
