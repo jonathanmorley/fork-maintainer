@@ -9,9 +9,9 @@
 //! - `upstream/<X>` — mirror of upstream's `X` (fast-forward only), the stack
 //!   base that patch PRs target.
 //! - `<X>` — the recomposed artifact: upstream base tree + patch stack + fork
-//!   owned files. Hosts fork workflows and release tags. *(composition is a
-//!   later milestone — this module currently focuses on branch syncing)*
+//!   owned files. Hosts fork workflows and release tags.
 
 pub mod compose;
 pub mod fetch;
+pub mod stack;
 pub mod sync;

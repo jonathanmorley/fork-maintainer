@@ -36,11 +36,19 @@ pointing at an upstream branch whose name differs from the fork's default.
       files onto a new upstream base
 - [x] Local bare-repo tests for detection and preservation
 
+**Milestone 3 — Patch stack overlay** ✅ (tree overlay on the base)
+
+- [x] Path-level change enumeration (`engine::stack::patch_changes`, rewrites disabled)
+- [x] Change application (`engine::stack::apply_changes`)
+- [x] Stack cascade (`engine::stack::apply_patch_stack`): layer ordered patch
+      diffs onto a base and write the stacked artifact
+- [x] Local bare-repo tests (add/remove/modify, empty stack, multi-patch cascade)
+
 **Up next**
 
-- [ ] Patch stack discovery and overlay onto the artifact
+- [ ] Full artifact pipeline: compose fork-owned overlay **and** patch stack together
 - [ ] Stack cascade-rebase (behind `Rebase` trait; gix rebase is "idea" stage)
-- [ ] GitHub App wiring (webhooks, installation tokens)
+- [ ] GitHub App wiring (webhooks, installation tokens, open-PR discovery)
 
 ## Project layout
 
@@ -54,6 +62,7 @@ src/
     sync.rs      — fast-forward mirror ref + sync_mirror orchestration
     fetch.rs     — fetch upstream over the git transport (remote/explicit refspec)
     compose.rs   — fork-owned file detection + artifact tree composition
+    stack.rs     — patch stack overlay (path changes + cascade onto a base)
 ```
 
 ## Development
