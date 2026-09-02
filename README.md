@@ -87,13 +87,29 @@ fork content must live on a stack branch.
       `refs/pull/<n>/head` member (skips non-pull refs) — the bridge from
       `discover_stack` output to `reconcile`
 - [x] `engine::fetch::fetch_ref()`: shared low-level single-ref fetch helper
-- [ ] (Not yet) Webhook server: signature verification, event dispatch, poll
-      loop
+
+**Milestone 7 — webhook server** ✅ (signature verification + event dispatch)
+
+- [x] `webhook::verify_signature()`: constant-time HMAC-SHA256 check of
+      `X-Hub-Signature-256` against the raw body keyed by the webhook secret
+- [x] `webhook::EventName`: classify `push` / `pull_request` vs. ignored events
+- [x] `webhook::dispatch()`: pure decision (bad signature / ignored / bad
+      payload / reconcile fork) from the request triple
+- [x] `webhook::handler()` + `router()`: axum `POST /api/webhook` endpoint,
+      mapping decisions to HTTP status (401/400/200), invoking an injected
+      per-fork action
+- [x] `main.rs`: boot the server from `AppConfig` (`FORK_MAINTAINER_CONFIG` /
+      `config.json`), resolve the affected fork and request a reconcile
+- [x] Unit tests (12): signature valid/tampered/wrong-secret, event mapping,
+      dispatch outcomes, handler status codes + dispatch invocation
+- [ ] (Not yet) Upstream-drift poll loop (the app cannot subscribe to upstream,
+      only to forks it is installed on)
 
 **Up next**
 
 - [ ] Stack cascade-rebase (behind `Rebase` trait; gix rebase is "idea" stage)
-- [ ] Webhook server: signature verification, event dispatch, upstream drift poll
+- [ ] Upstream-drift poll loop; wire webhook reconcile to the full engine
+      (install token + local mirror + `reconcile`)
 
 ## Project layout
 
@@ -101,6 +117,7 @@ fork content must live on a stack branch.
 src/
   lib.rs           — library root
   config.rs        — fork config (upstream, fork, mirror branch derivation)
+  webhook.rs       — GitHub webhook signature verification + event dispatch
   github/
     mod.rs         — module root + re-exports
     discovery.rs   — open-PR stack discovery (ordering logic) + live PR fetch
@@ -111,6 +128,7 @@ src/
     fetch.rs       — fetch upstream / PR-head refs over the git transport
     stack.rs       — artifact composition (path changes + branch-stack overlay)
     pipeline.rs    — reconcile: config-derived sync + compose in one pass
+  main.rs          — binary: load config, run the webhook server
 ```
 
 ## Development
@@ -120,6 +138,18 @@ cargo build
 cargo test
 cargo clippy
 ```
+
+### Run the webhook server
+
+```bash
+FORK_MAINTAINER_ADDR=127.0.0.1:3000 \
+  FORK_MAINTAINER_CONFIG=/path/to/config.json \
+  cargo run
+```
+
+`config.json` is an [`AppConfig`](src/config.rs) with a `webhook_secret` and the
+forks to maintain. GitHub is configured to POST events to `/api/webhook`;
+signatures are verified before anything is dispatched.
 
 Tests run against temporary bare repositories in the system temp dir, and
 fetches use the local `file://` transport. No network or GitHub tokens
