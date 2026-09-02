@@ -123,8 +123,8 @@ fn write_ref(
     target: gix::ObjectId,
     previous: Option<gix::ObjectId>,
 ) -> anyhow::Result<()> {
-    use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
     use gix::refs::Target;
+    use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
 
     let constraint = match previous {
         Some(prev) => PreviousValue::ExistingMustMatch(Target::Object(prev)),
@@ -148,7 +148,11 @@ fn write_ref(
 }
 
 /// Return true if `ancestor` is an ancestor of (or equal to) `descendant`.
-fn is_ancestor(repo: &Repository, ancestor: gix::ObjectId, descendant: gix::ObjectId) -> anyhow::Result<bool> {
+fn is_ancestor(
+    repo: &Repository,
+    ancestor: gix::ObjectId,
+    descendant: gix::ObjectId,
+) -> anyhow::Result<bool> {
     if ancestor == descendant {
         return Ok(true);
     }
@@ -281,7 +285,12 @@ mod tests {
         let c1 = commit_with_file(&upstream, "a.txt", "one", "one", None);
         let c2 = commit_with_file(&upstream, "a.txt", "two", "two", Some(c1));
         upstream
-            .reference("refs/heads/main", c1, PreviousValue::Any, "init upstream branch")
+            .reference(
+                "refs/heads/main",
+                c1,
+                PreviousValue::Any,
+                "init upstream branch",
+            )
             .expect("create upstream main");
 
         let fork_dir = temp_dir("sync_fork");
@@ -302,7 +311,12 @@ mod tests {
 
         // Upstream advances main to c2.
         upstream
-            .reference("refs/heads/main", c2, PreviousValue::ExistingMustMatch(gix::refs::Target::Object(c1)), "advance upstream main")
+            .reference(
+                "refs/heads/main",
+                c2,
+                PreviousValue::ExistingMustMatch(gix::refs::Target::Object(c1)),
+                "advance upstream main",
+            )
             .expect("advance upstream main");
 
         // Second sync: mirror is fast-forwarded c1 -> c2.

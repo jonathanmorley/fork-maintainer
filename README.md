@@ -75,13 +75,24 @@ fork content must live on a stack branch.
       client; `install_https_token()` for HTTPS git access
 - [x] Unit tests: valid key parses, invalid key fails, client builds with a
       valid key (via `#[tokio::test]`)
-- [ ] (Not yet) Live octocrab fetch of open PRs + PR head branches into
-      `refs/pull/<n>/head`; webhook server and signature verification
+
+**Milestone 6 — live open-PR discovery + PR-head fetch** ✅
+
+- [x] `github::live_prs()`: page a fork's open PRs via octocrab and reduce them
+      to `PrInfo` (number, head branch, base branch)
+- [x] `PrInfo::from_pull_request()`: pure octocrab-model → `PrInfo` mapping
+- [x] `engine::fetch::fetch_pr_head()`: bring `refs/pull/<n>/head` into the
+      local mirror from the fork
+- [x] `engine::fetch::fetch_pull_refs()`: for an ordered stack, fetch every
+      `refs/pull/<n>/head` member (skips non-pull refs) — the bridge from
+      `discover_stack` output to `reconcile`
+- [x] `engine::fetch::fetch_ref()`: shared low-level single-ref fetch helper
+- [ ] (Not yet) Webhook server: signature verification, event dispatch, poll
+      loop
 
 **Up next**
 
 - [ ] Stack cascade-rebase (behind `Rebase` trait; gix rebase is "idea" stage)
-- [ ] Live open-PR discovery (octocrab list/fetch) wired to `discover_stack`
 - [ ] Webhook server: signature verification, event dispatch, upstream drift poll
 
 ## Project layout
@@ -92,12 +103,12 @@ src/
   config.rs        — fork config (upstream, fork, mirror branch derivation)
   github/
     mod.rs         — module root + re-exports
-    discovery.rs   — open-PR stack discovery (ordering logic)
+    discovery.rs   — open-PR stack discovery (ordering logic) + live PR fetch
     auth.rs        — GitHub App identity, installation client + token
   engine/
     mod.rs         — git engine root
     sync.rs        — fast-forward mirror ref + sync_mirror orchestration
-    fetch.rs       — fetch upstream over the git transport (remote/explicit refspec)
+    fetch.rs       — fetch upstream / PR-head refs over the git transport
     stack.rs       — artifact composition (path changes + branch-stack overlay)
     pipeline.rs    — reconcile: config-derived sync + compose in one pass
 ```

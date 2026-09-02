@@ -54,9 +54,7 @@ impl AppCredentials {
     /// organization, and to mint installation access tokens.
     pub fn app_client(&self) -> Result<Octocrab> {
         let key = self.encoding_key()?;
-        Ok(Octocrab::builder()
-            .app(AppId(self.app_id), key)
-            .build()?)
+        Ok(Octocrab::builder().app(AppId(self.app_id), key).build()?)
     }
 }
 
@@ -71,15 +69,8 @@ impl AppCredentials {
 ///
 /// Returns an error if the repo is not installed / reachable for this app, or
 /// if the app client is not app-authenticated.
-pub async fn install_client(
-    app: &Octocrab,
-    owner: &str,
-    repo: &str,
-) -> Result<Octocrab> {
-    let installation = app
-        .apps()
-        .get_repository_installation(owner, repo)
-        .await?;
+pub async fn install_client(app: &Octocrab, owner: &str, repo: &str) -> Result<Octocrab> {
+    let installation = app.apps().get_repository_installation(owner, repo).await?;
     Ok(app.installation(installation.id)?)
 }
 
@@ -88,10 +79,7 @@ pub async fn install_client(
 ///
 /// `app` must be app-authenticated. The token is valid for ~1 hour.
 pub async fn install_https_token(app: &Octocrab, owner: &str, repo: &str) -> Result<String> {
-    let installation = app
-        .apps()
-        .get_repository_installation(owner, repo)
-        .await?;
+    let installation = app.apps().get_repository_installation(owner, repo).await?;
     let scoped = app.installation(installation.id)?;
     let token = scoped.installation_token().await?;
     Ok(token.expose_secret().to_owned())

@@ -243,7 +243,10 @@ mod tests {
             tree_blob(&fork, outcome.compose.tree, ".github/ci.yml").as_deref(),
             Some("workflow")
         );
-        assert_eq!(ref_id(&fork, "refs/heads/main"), Some(outcome.compose.commit));
+        assert_eq!(
+            ref_id(&fork, "refs/heads/main"),
+            Some(outcome.compose.commit)
+        );
     }
 
     #[test]
@@ -271,7 +274,10 @@ mod tests {
 
         // Mirror is upstream/canonical (the override), artifact is main.
         assert_eq!(ref_id(&fork, "refs/heads/upstream/canonical"), Some(c1));
-        assert_eq!(ref_id(&fork, "refs/heads/main"), Some(outcome.compose.commit));
+        assert_eq!(
+            ref_id(&fork, "refs/heads/main"),
+            Some(outcome.compose.commit)
+        );
         assert!(!tree_has_entry(&fork, outcome.compose.tree, "nope.txt"));
     }
 
@@ -345,6 +351,9 @@ mod tests {
             tree_blob(&fork, outcome.compose.tree, "a.txt").as_deref(),
             Some("a1")
         );
-        assert_eq!(ref_id(&fork, "refs/heads/main"), Some(outcome.compose.commit));
+        assert_eq!(
+            ref_id(&fork, "refs/heads/main"),
+            Some(outcome.compose.commit)
+        );
     }
 }

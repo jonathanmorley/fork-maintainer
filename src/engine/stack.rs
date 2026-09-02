@@ -71,11 +71,7 @@ impl PathChange {
 /// With rewrite tracking disabled, this yields clean [`Upsert`](PathChange::Upsert)
 /// and [`Remove`](PathChange::Remove) events; intermediate tree entries
 /// (directories) are dropped since their leaf entries are reported separately.
-pub fn patch_changes(
-    repo: &Repository,
-    from_ref: &str,
-    to_ref: &str,
-) -> Result<Vec<PathChange>> {
+pub fn patch_changes(repo: &Repository, from_ref: &str, to_ref: &str) -> Result<Vec<PathChange>> {
     let from_tree = tree_at_ref(repo, from_ref)?;
     let to_tree = tree_at_ref(repo, to_ref)?;
     tree_changes(&from_tree, &to_tree)
@@ -86,10 +82,7 @@ pub fn patch_changes(
 /// With rewrite tracking disabled this yields clean upsert/remove events;
 /// intermediate tree entries (directories) are dropped since their leaf
 /// entries are reported separately.
-fn tree_changes(
-    from_tree: &gix::Tree<'_>,
-    to_tree: &gix::Tree<'_>,
-) -> Result<Vec<PathChange>> {
+fn tree_changes(from_tree: &gix::Tree<'_>, to_tree: &gix::Tree<'_>) -> Result<Vec<PathChange>> {
     let mut changes = Vec::new();
     let mut platform = from_tree.changes()?;
     platform.options(|opts| {
@@ -228,10 +221,7 @@ pub fn compose(
         .new_commit_as(
             committer,
             committer,
-            format!(
-                "Recompose artifact from {} stack branches",
-                branches.len()
-            ),
+            format!("Recompose artifact from {} stack branches", branches.len()),
             running,
             [base_commit],
         )?
@@ -247,7 +237,10 @@ pub fn compose(
 }
 
 /// Read the tree and commit id that a ref's commit points to.
-fn peel_tree_and_commit(repo: &Repository, ref_name: &str) -> Result<(gix::ObjectId, gix::ObjectId)> {
+fn peel_tree_and_commit(
+    repo: &Repository,
+    ref_name: &str,
+) -> Result<(gix::ObjectId, gix::ObjectId)> {
     let oid = repo.find_reference(ref_name)?.id().detach();
     let commit = repo.find_commit(oid)?;
     Ok((commit.tree_id()?.detach(), oid))
@@ -263,8 +256,8 @@ fn tree_at_ref<'r>(repo: &'r Repository, ref_name: &str) -> Result<gix::Tree<'r>
 /// Point `target_ref` at `commit` unconditionally (stack artifact rewrites are
 /// normal).
 fn write_ref(repo: &Repository, target_ref: &str, commit: gix::ObjectId) -> Result<()> {
-    use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
     use gix::refs::Target;
+    use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
 
     repo.edit_reference(RefEdit {
         change: Change::Update {
@@ -408,12 +401,7 @@ mod tests {
         set_ref(&repo, "refs/heads/target", target);
 
         let changes = patch_changes(&repo, "refs/heads/base", "refs/heads/target").unwrap();
-        let base_tree = repo
-            .find_commit(base)
-            .unwrap()
-            .tree_id()
-            .unwrap()
-            .detach();
+        let base_tree = repo.find_commit(base).unwrap().tree_id().unwrap().detach();
         let new_tree = apply_changes(&repo, base_tree, &changes).unwrap();
 
         assert_eq!(tree_blob(&repo, new_tree, "a.txt").as_deref(), Some("a2"));
@@ -487,8 +475,14 @@ mod tests {
             tree_blob(&repo, outcome.tree, ".github/ci.yml").as_deref(),
             Some("workflow")
         );
-        assert_eq!(tree_blob(&repo, outcome.tree, "a.txt").as_deref(), Some("a2"));
-        assert_eq!(tree_blob(&repo, outcome.tree, "helper.txt").as_deref(), Some("h"));
+        assert_eq!(
+            tree_blob(&repo, outcome.tree, "a.txt").as_deref(),
+            Some("a2")
+        );
+        assert_eq!(
+            tree_blob(&repo, outcome.tree, "helper.txt").as_deref(),
+            Some("h")
+        );
         assert_eq!(
             tree_blob(&repo, outcome.tree, "feature.txt").as_deref(),
             Some("f")
@@ -544,7 +538,11 @@ mod tests {
         set_ref(&repo, "refs/heads/main", scratch);
         assert!(tree_has_entry(
             &repo,
-            repo.find_commit(scratch).unwrap().tree_id().unwrap().detach(),
+            repo.find_commit(scratch)
+                .unwrap()
+                .tree_id()
+                .unwrap()
+                .detach(),
             "scratch.txt"
         ));
 
@@ -605,8 +603,14 @@ mod tests {
 
         // b.txt was added upstream after the fork; it is NOT a deletion the
         // branch made, so it survives. The fork-owned layer adds .github/ci.yml.
-        assert_eq!(tree_blob(&repo, outcome.tree, "a.txt").as_deref(), Some("a1"));
-        assert_eq!(tree_blob(&repo, outcome.tree, "b.txt").as_deref(), Some("b2"));
+        assert_eq!(
+            tree_blob(&repo, outcome.tree, "a.txt").as_deref(),
+            Some("a1")
+        );
+        assert_eq!(
+            tree_blob(&repo, outcome.tree, "b.txt").as_deref(),
+            Some("b2")
+        );
         assert_eq!(
             tree_blob(&repo, outcome.tree, ".github/ci.yml").as_deref(),
             Some("workflow")
@@ -631,7 +635,10 @@ mod tests {
         .expect("compose empty stack");
 
         assert_eq!(outcome.patches_applied, 0);
-        assert_eq!(tree_blob(&repo, outcome.tree, "a.txt").as_deref(), Some("a1"));
+        assert_eq!(
+            tree_blob(&repo, outcome.tree, "a.txt").as_deref(),
+            Some("a1")
+        );
         assert_eq!(ref_id(&repo, "refs/heads/main"), Some(outcome.commit));
     }
 }

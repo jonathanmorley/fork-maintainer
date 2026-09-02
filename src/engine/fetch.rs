@@ -48,37 +48,101 @@ pub fn fetch_upstream(
     branch: &str,
     track_ref: &str, // e.g. "refs/remotes/upstream/main"
 ) -> Result<FetchedTip> {
+    let full_remote_ref = format!("refs/heads/{branch}");
+    let oid = fetch_ref(repo, upstream_url, &full_remote_ref, track_ref)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "upstream did not advertise branch `{branch}` (fetched via `{upstream_url}`)"
+        )
+    })?;
+    Ok(FetchedTip { oid })
+}
+
+/// Fetch a single remote ref from `url` into the local `local_ref`, and return
+/// the fetched object id (or `None` if the remote did not advertise it).
+///
+/// `remote_ref` is the fully-qualified ref name on the remote (e.g.
+/// `refs/heads/main`, `refs/pull/12/head`) and `local_ref` is where it lands
+/// locally (e.g. `refs/remotes/upstream/main`, `refs/pull/12/head`).
+///
+/// The fetch uses a single explicit refspec so the ref lands exactly where we
+/// control it, not in git's default `refs/remotes/<name>/...` location. Only
+/// objects are brought in; no ref policy is applied by this function.
+///
+/// See the [module docs](self) for blocking semantics.
+fn fetch_ref(
+    repo: &Repository,
+    url: &str,
+    remote_ref: &str,
+    local_ref: &str,
+) -> Result<Option<gix::ObjectId>> {
     use gix::remote::Direction;
 
-    let spec = format!("refs/heads/{branch}:{track_ref}");
+    let spec = format!("{remote_ref}:{local_ref}");
     let remote = repo
-        .remote_at(upstream_url)?
+        .remote_at(url)?
         .with_refspecs([spec.as_str()], Direction::Fetch)?;
 
     let connection = remote.connect(Direction::Fetch)?;
-    let prepare = connection
-        .prepare_fetch(
-            gix::progress::Discard,
-            gix::remote::ref_map::Options::default(),
-        )?;
+    let prepare = connection.prepare_fetch(
+        gix::progress::Discard,
+        gix::remote::ref_map::Options::default(),
+    )?;
 
     let outcome = prepare.receive(gix::progress::Discard, &Default::default())?;
 
-    let full_remote_ref = format!("refs/heads/{branch}");
     let oid = outcome
         .ref_map
         .mappings
         .iter()
-        .find(|m| full_remote_ref.as_str().eq(m.remote.as_name().unwrap_or_default()))
+        .find(|m| remote_ref.eq(m.remote.as_name().unwrap_or_default()))
         .and_then(|m| m.remote.peeled_id())
-        .map(gix::oid::to_owned)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "upstream did not advertise branch `{branch}` (fetched via `{upstream_url}`)"
-            )
-        })?;
+        .map(gix::oid::to_owned);
 
+    Ok(oid)
+}
+
+/// Fetch a PR's head commit from the fork's `url` into `refs/pull/<n>/head`.
+///
+/// This mirrors what GitHub's own `refs/pull/<n>/head` alias exposes: the tip
+/// of the pull request's head branch. It is what makes a discovered PR concrete
+/// in the local object store so `compose` can layer it. Currently force-updates
+/// the local pull ref (a PR's head moves as its branch is pushed).
+///
+/// See the [module docs](self) for blocking semantics.
+pub fn fetch_pr_head(
+    repo: &Repository,
+    url: &str,
+    pr_number: u64,
+    local_ref: &str, // e.g. "refs/pull/12/head"
+) -> Result<FetchedTip> {
+    let remote_ref = format!("refs/pull/{pr_number}/head");
+    let oid = fetch_ref(repo, url, &remote_ref, local_ref)?.ok_or_else(|| {
+        anyhow::anyhow!("fork did not advertise `{remote_ref}` (fetched via `{url}`)")
+    })?;
     Ok(FetchedTip { oid })
+}
+
+/// Fetch every PR head ref in `stack` from `fork_url` into the local mirror.
+///
+/// `stack` is the ordered list of refs produced by
+/// [`crate::github::discover_stack`], e.g. `refs/pull/12/head`. Only entries of
+/// the form `refs/pull/<n>/head` are fetched (fork-owned branches and other
+/// head refs are expected to already be present locally). This is what makes a
+/// discovered stack concrete before
+/// [`crate::engine::pipeline::reconcile`] composes it.
+///
+/// See the [module docs](self) for blocking semantics.
+pub fn fetch_pull_refs(repo: &Repository, fork_url: &str, stack: &[String]) -> Result<()> {
+    for rf in stack {
+        let pr_number = rf
+            .strip_prefix("refs/pull/")
+            .and_then(|rest| rest.strip_suffix("/head"))
+            .and_then(|n| n.parse::<u64>().ok());
+        if let Some(number) = pr_number {
+            fetch_pr_head(repo, fork_url, number, rf)?;
+        }
+    }
+    Ok(())
 }
 
 /// Convenience wrapper: fetch `branch` into `track_ref` from a local bare
@@ -150,7 +214,12 @@ mod tests {
         let upstream = gix::init_bare(&upstream_dir).expect("init upstream");
         let c1 = commit_with_file(&upstream, "a.txt", "one", "one", None);
         upstream
-            .reference("refs/heads/main", c1, PreviousValue::Any, "init upstream branch")
+            .reference(
+                "refs/heads/main",
+                c1,
+                PreviousValue::Any,
+                "init upstream branch",
+            )
             .expect("create upstream main");
 
         // Fork: an empty bare repo.
@@ -158,8 +227,9 @@ mod tests {
         let fork = gix::init_bare(&fork_dir).expect("init fork");
         assert_eq!(ref_id(&fork, "refs/remotes/upstream/main"), None);
 
-        let tip = fetch_upstream_from_path(&fork, &upstream_dir, "main", "refs/remotes/upstream/main")
-            .expect("fetch upstream");
+        let tip =
+            fetch_upstream_from_path(&fork, &upstream_dir, "main", "refs/remotes/upstream/main")
+                .expect("fetch upstream");
         assert_eq!(tip.oid, c1);
 
         // The fetch wrote the tracking ref for the caller to fast-forward from.
@@ -172,14 +242,20 @@ mod tests {
         let upstream = gix::init_bare(&upstream_dir).expect("init upstream");
         let c1 = commit_with_file(&upstream, "a.txt", "one", "one", None);
         upstream
-            .reference("refs/heads/main", c1, PreviousValue::Any, "init upstream branch")
+            .reference(
+                "refs/heads/main",
+                c1,
+                PreviousValue::Any,
+                "init upstream branch",
+            )
             .expect("create upstream main");
 
         let fork_dir = temp_dir("fork_none");
         let fork = gix::init_bare(&fork_dir).expect("init fork");
 
-        let err = fetch_upstream_from_path(&fork, &upstream_dir, "nope", "refs/remotes/upstream/nope")
-            .expect_err("should fail for missing branch");
+        let err =
+            fetch_upstream_from_path(&fork, &upstream_dir, "nope", "refs/remotes/upstream/nope")
+                .expect_err("should fail for missing branch");
         // gix rejects a fetch whose explicit refspec matched nothing.
         assert!(
             err.to_string().contains("refs/heads/nope"),
@@ -188,5 +264,98 @@ mod tests {
         // And the tracking ref must not have been created.
         assert_eq!(ref_id(&fork, "refs/remotes/upstream/nope"), None);
     }
-}
 
+    #[test]
+    fn fetches_pr_head_into_pull_ref() {
+        // A fork "remote": a bare repo with a PR head branch and a refs/pull
+        // alias pointing at it (as GitHub exposes for open PRs).
+        let fork_dir = temp_dir("pr_fork_remote");
+        let remote = gix::init_bare(&fork_dir).expect("init remote");
+        let pr_commit = commit_with_file(&remote, "feat.txt", "f", "feat", None);
+        remote
+            .reference(
+                "refs/pull/12/head",
+                pr_commit,
+                PreviousValue::Any,
+                "init pr head",
+            )
+            .expect("create pull ref");
+
+        // Local mirror: empty bare repo.
+        let mirror_dir = temp_dir("pr_mirror");
+        let mirror = gix::init_bare(&mirror_dir).expect("init mirror");
+        assert_eq!(ref_id(&mirror, "refs/pull/12/head"), None);
+
+        let tip = fetch_pr_head(
+            &mirror,
+            &fork_dir.display().to_string(),
+            12,
+            "refs/pull/12/head",
+        )
+        .expect("fetch pr head");
+        assert_eq!(tip.oid, pr_commit);
+        assert_eq!(ref_id(&mirror, "refs/pull/12/head"), Some(pr_commit));
+    }
+
+    #[test]
+    fn errors_when_pr_head_missing() {
+        let fork_dir = temp_dir("pr_fork_missing");
+        let remote = gix::init_bare(&fork_dir).expect("init remote");
+        let c = commit_with_file(&remote, "a.txt", "a", "c", None);
+        remote
+            .reference("refs/heads/main", c, PreviousValue::Any, "init main")
+            .expect("create main");
+
+        let mirror_dir = temp_dir("pr_mirror_missing");
+        let mirror = gix::init_bare(&mirror_dir).expect("init mirror");
+
+        let err = fetch_pr_head(
+            &mirror,
+            &fork_dir.display().to_string(),
+            99,
+            "refs/pull/99/head",
+        )
+        .expect_err("should fail for missing pr ref");
+        assert!(
+            err.to_string().contains("refs/pull/99/head"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(ref_id(&mirror, "refs/pull/99/head"), None);
+    }
+
+    #[test]
+    fn fetch_pull_refs_fetches_only_pr_heads() {
+        // Fork remote with two PR heads and a plain branch.
+        let fork_dir = temp_dir("prs_remote");
+        let remote = gix::init_bare(&fork_dir).expect("init remote");
+        let pr12 = commit_with_file(&remote, "f12.txt", "12", "pr12", None);
+        let pr13 = commit_with_file(&remote, "f13.txt", "13", "pr13", None);
+        remote
+            .reference("refs/pull/12/head", pr12, PreviousValue::Any, "pr12")
+            .expect("pr12");
+        remote
+            .reference("refs/pull/13/head", pr13, PreviousValue::Any, "pr13")
+            .expect("pr13");
+
+        // Local mirror with its own fork-owned branch (local object) that
+        // fetch_pull_refs must not touch.
+        let mirror_dir = temp_dir("prs_mirror");
+        let mirror = gix::init_bare(&mirror_dir).expect("init mirror");
+        let owned = commit_with_file(&mirror, "owned.txt", "o", "owned", None);
+        mirror
+            .reference("refs/heads/fork-owned", owned, PreviousValue::Any, "owned")
+            .expect("owned");
+
+        let stack = vec![
+            "refs/heads/fork-owned".to_string(),
+            "refs/pull/12/head".to_string(),
+            "refs/pull/13/head".to_string(),
+        ];
+        fetch_pull_refs(&mirror, &fork_dir.display().to_string(), &stack).expect("fetch pr refs");
+
+        // PR heads fetched; non-pull refs untouched.
+        assert_eq!(ref_id(&mirror, "refs/pull/12/head"), Some(pr12));
+        assert_eq!(ref_id(&mirror, "refs/pull/13/head"), Some(pr13));
+        assert_eq!(ref_id(&mirror, "refs/heads/fork-owned"), Some(owned));
+    }
+}

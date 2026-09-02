@@ -16,6 +16,52 @@ pub struct PrInfo {
     pub base_branch: String,
 }
 
+impl PrInfo {
+    /// Map an octocrab [`PullRequest`] into the reduced form discovery needs.
+    ///
+    /// Extracts the PR number, head branch (the branch carrying the PR's
+    /// changes), and base branch (the branch the PR targets). This is pure and
+    /// unit-testable without a network.
+    pub fn from_pull_request(pr: &octocrab::models::pulls::PullRequest) -> Self {
+        Self {
+            number: pr.number,
+            head_branch: pr.head.ref_field.clone(),
+            base_branch: pr.base.ref_field.clone(),
+        }
+    }
+}
+
+/// Fetch a fork's open pull requests from GitHub and reduce them to
+/// [`PrInfo`].
+///
+/// `client` must be an *installation-scoped* octocrab client for the fork (see
+/// [`crate::github::auth::install_client`]). All open PRs for `fork` are paged
+/// in, in ascending order, and returned as [`PrInfo`]. Whether a PR belongs in
+/// this fork's patch stack (e.g. its base is the tracked upstream branch or
+/// another stack member) is a separate decision for the caller /
+/// [`discover_stack`].
+///
+/// # Errors
+///
+/// Returns any octocrab API error from listing the fork's pull requests. This
+/// is a network call and is exercised only against live GitHub.
+pub async fn live_prs(
+    client: &octocrab::Octocrab,
+    fork: &crate::config::Repo,
+) -> octocrab::Result<Vec<PrInfo>> {
+    let handler = client.pulls(fork.owner.clone(), fork.name.clone());
+    let first = handler
+        .list()
+        .state(octocrab::params::State::Open)
+        .sort(octocrab::params::pulls::Sort::Created)
+        .direction(octocrab::params::Direction::Ascending)
+        .per_page(100)
+        .send()
+        .await?;
+    let all = client.all_pages(first).await?;
+    Ok(all.iter().map(PrInfo::from_pull_request).collect())
+}
+
 /// Errors produced while resolving the PR stack order.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum StackError {
@@ -142,7 +188,10 @@ mod tests {
         let stack = discover_stack("main", None, &prs).expect("stack");
         assert_eq!(
             stack,
-            vec!["refs/pull/19/head".to_string(), "refs/pull/20/head".to_string()]
+            vec![
+                "refs/pull/19/head".to_string(),
+                "refs/pull/20/head".to_string()
+            ]
         );
     }
 
