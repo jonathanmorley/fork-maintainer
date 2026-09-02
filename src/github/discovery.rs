@@ -1,23 +1,9 @@
-//! GitHub interaction and the stack-discovery seam.
+//! Open-pull-request stack discovery.
 //!
-//! # Status
-//!
-//! The GitHub App identity wiring (JWT from the app private key, installation
-//! tokens, webhook verification, `octocrab` client construction) is still a
-//! placeholder — see the notes at the bottom of this module.
-//!
-//! What is implemented and tested here is the **stack-discovery ordering**:
-//! turning the raw set of a fork's open PRs (each with its head and base
-//! branch) into the *ordered* list of local refs the artifact engine composes.
-//! This is pure logic, decoupled from any network call, so it is fully
-//! unit-testable — the seam where the octocrab layer will plug in later.
-//!
-//! # Discovery model
-//!
-//! The fork's artifact is an ordered stack of branches over the upstream base:
-//! the fork-owned branch (bottom), then the open pull requests in dependency
-//! order. Each PR is placeable once its base is itself placed — the base is
-//! either the upstream base branch or the head of an already-placed PR.
+//! Turns the raw set of a fork's open PRs (each with its head and base branch)
+//! into the *ordered* list of local refs the artifact engine composes. This is
+//! pure logic, decoupled from any network call, so it is fully unit-testable —
+//! the seam where the live octocrab layer (see [`super::auth`]) plugs in.
 
 /// A GitHub pull request, reduced to the fields discovery needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,17 +107,6 @@ pub fn discover_stack(
     Ok(ordered)
 }
 
-// ---------------------------------------------------------------------------
-// Future wiring (not yet implemented):
-// - GitHub App identity: build a JWT from the app's private key, exchange it
-//   for a short-lived installation token, and cache/refresh it.
-// - A typed `octocrab` client authenticated as the installation.
-// - `list_open_pull_requests(fork)` -> Vec<PrInfo>: fetch the fork's open PRs
-//   via the API and map each to its head/base branch, then feed
-//   `discover_stack`.
-// - Webhook signature verification and handler dispatch.
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,10 +122,7 @@ mod tests {
     #[test]
     fn orders_fork_owned_then_stacked_prs() {
         // fork-owned is the bottom; PR 12 targets main, PR 13 stacks on PR 12.
-        let prs = vec![
-            pr(13, "feat-b", "feat-a"),
-            pr(12, "feat-a", "main"),
-        ];
+        let prs = vec![pr(13, "feat-b", "feat-a"), pr(12, "feat-a", "main")];
         let stack = discover_stack("main", Some("fork-owned"), &prs).expect("stack");
         assert_eq!(
             stack,
@@ -170,10 +142,7 @@ mod tests {
         let stack = discover_stack("main", None, &prs).expect("stack");
         assert_eq!(
             stack,
-            vec![
-                "refs/pull/19/head".to_string(),
-                "refs/pull/20/head".to_string(),
-            ]
+            vec!["refs/pull/19/head".to_string(), "refs/pull/20/head".to_string()]
         );
     }
 

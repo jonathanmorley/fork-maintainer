@@ -59,8 +59,6 @@ pointing at an upstream branch whose name differs from the fork's default.
       base chain (same-level take ascending number); deterministic
 - [x] Errors on unknown bases and PR cycles
 - [x] End-to-end `discover_stack` -> `reconcile` test over a local repo
-- [ ] (Not yet) App identity / installation tokens / live octocrab fetch of
-      open PRs and PR head branches into `refs/pull/<n>/head`
 
 **Design note:** fork-owned files are *not* a separate mechanism — they are
 just another stacked branch (conceptually an open PR against `upstream/<X>`
@@ -68,25 +66,40 @@ that is never merged upstream). Because `<X>` is rebuilt from the upstream base
 every cycle, ad-hoc manual edits made directly on `<X>` are discarded; persistent
 fork content must live on a stack branch.
 
+**Milestone 5 — GitHub App identity** ✅ (credentials + installation clients)
+
+- [x] `github::auth::AppCredentials`: app id + RSA private key, with PEM
+      parsing validated at build time (`encoding_key()` errors on invalid PEM)
+- [x] `app_client()`: build the app-authenticated `octocrab` client
+- [x] `install_client()`: resolve a repo's installation and return a scoped
+      client; `install_https_token()` for HTTPS git access
+- [x] Unit tests: valid key parses, invalid key fails, client builds with a
+      valid key (via `#[tokio::test]`)
+- [ ] (Not yet) Live octocrab fetch of open PRs + PR head branches into
+      `refs/pull/<n>/head`; webhook server and signature verification
+
 **Up next**
 
 - [ ] Stack cascade-rebase (behind `Rebase` trait; gix rebase is "idea" stage)
-- [ ] GitHub App wiring: identity (JWT/installation tokens), webhooks, live
-      octocrab fetch of open PRs and PR head branches into `refs/pull/<n>/head`
+- [ ] Live open-PR discovery (octocrab list/fetch) wired to `discover_stack`
+- [ ] Webhook server: signature verification, event dispatch, upstream drift poll
 
 ## Project layout
 
 ```
 src/
-  lib.rs         — library root
-  config.rs      — fork config (upstream, fork, mirror branch derivation)
-  github.rs      — open-PR stack discovery (ordering logic; App wiring pending)
+  lib.rs           — library root
+  config.rs        — fork config (upstream, fork, mirror branch derivation)
+  github/
+    mod.rs         — module root + re-exports
+    discovery.rs   — open-PR stack discovery (ordering logic)
+    auth.rs        — GitHub App identity, installation client + token
   engine/
-    mod.rs       — git engine root
-    sync.rs      — fast-forward mirror ref + sync_mirror orchestration
-    fetch.rs     — fetch upstream over the git transport (remote/explicit refspec)
-    stack.rs     — artifact composition (path changes + branch-stack overlay)
-    pipeline.rs  — reconcile: config-derived sync + compose in one pass
+    mod.rs         — git engine root
+    sync.rs        — fast-forward mirror ref + sync_mirror orchestration
+    fetch.rs       — fetch upstream over the git transport (remote/explicit refspec)
+    stack.rs       — artifact composition (path changes + branch-stack overlay)
+    pipeline.rs    — reconcile: config-derived sync + compose in one pass
 ```
 
 ## Development
