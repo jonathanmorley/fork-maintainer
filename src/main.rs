@@ -19,7 +19,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use fork_maintainer::config::{AppConfig, ForkConfig};
-use fork_maintainer::poll::{self, PollOutcome};
+use fork_maintainer::github::auth::AppCredentials;
+use fork_maintainer::poll::PollOutcome;
 use fork_maintainer::webhook::AppState;
 use gix::actor::SignatureRef;
 
@@ -35,9 +36,10 @@ fn main() -> Result<()> {
 
     let runtime = tokio::runtime::Runtime::new().context("create tokio runtime")?;
     runtime.block_on(async move {
+        let app = cfg.credentials();
         let state = AppState {
             secret: cfg.webhook_secret.clone(),
-            handle: make_dispatcher(cfg.forks.clone()),
+            handle: make_dispatcher(app.clone(), cfg.forks.clone()),
         };
         let router = fork_maintainer::webhook::router(state);
 
@@ -84,35 +86,41 @@ fn spawn_poll_loop(cfg: AppConfig) -> tokio::task::JoinHandle<()> {
 }
 
 /// Run a single poll pass for all configured forks.
-///
-/// The reconcile itself is blocking git I/O, so it runs on a worker thread via
-/// [`tokio::task::spawn_blocking`]; only the results are logged back on the
-/// async context.
 async fn poll_once(cfg: &AppConfig) {
+    let app = cfg.credentials();
     let forks = cfg.forks.clone();
-    let fork_list = forks.clone();
-    let outcomes = tokio::task::spawn_blocking(move || {
-        let committer = SignatureRef::from_bytes(COMMITTER).expect("valid committer");
-        poll::run_pass(&fork_list, |fork| {
-            // Open-PR stack discovery is a follow-up. For now reconcile the
-            // upstream mirror + base artifact, which is what surfaces upstream
-            // drift; the artifact recomposes on the freshly synced base.
-            poll::reconcile_fork(fork, &fork.upstream.https_url(), &[], committer)
-        })
-    })
-    .await
-    .expect("poll blocking task panicked");
+    for fork in &forks {
+        let outcome = reconcile_fork(app.clone(), fork.clone()).await;
+        log_outcome(fork, outcome);
+    }
+}
 
-    for (fork, outcome) in forks.iter().zip(outcomes) {
-        match outcome {
-            PollOutcome::NoChange => tracing::debug!(fork = %fork.fork, "no upstream drift"),
-            PollOutcome::Changed { note } => {
-                tracing::info!(fork = %fork.fork, %note, "fork reconciled")
-            }
-            PollOutcome::Failed(err) => {
-                tracing::warn!(fork = %fork.fork, "reconcile failed: {err}")
-            }
+/// Reconcile a single fork against live GitHub, returning its [`PollOutcome`].
+///
+/// Requires app credentials (to mint an installation client + token) and a
+/// configured `local_mirror`. Missing either yields [`PollOutcome::Failed`].
+async fn reconcile_fork(app: Option<AppCredentials>, fork: ForkConfig) -> PollOutcome {
+    let Some(app) = app else {
+        tracing::warn!(fork = %fork.fork, "no app credentials configured; cannot reconcile live");
+        return PollOutcome::Failed("no app credentials configured".into());
+    };
+    if fork.local_mirror.is_none() {
+        tracing::warn!(fork = %fork.fork, "fork has no local_mirror; skipping");
+        return PollOutcome::Failed("fork has no local_mirror configured".into());
+    }
+    let committer = SignatureRef::from_bytes(COMMITTER).expect("valid committer");
+    let result = fork_maintainer::reconcile::reconcile_fork_live(&app, &fork, committer).await;
+    fork_maintainer::poll::classify(result)
+}
+
+/// Log a fork's poll outcome at the appropriate level.
+fn log_outcome(fork: &ForkConfig, outcome: PollOutcome) {
+    match outcome {
+        PollOutcome::NoChange => tracing::debug!(fork = %fork.fork, "no upstream drift"),
+        PollOutcome::Changed { note } => {
+            tracing::info!(fork = %fork.fork, %note, "fork reconciled")
         }
+        PollOutcome::Failed(err) => tracing::warn!(fork = %fork.fork, "reconcile failed: {err}"),
     }
 }
 
@@ -132,6 +140,7 @@ fn load_config() -> Result<AppConfig> {
     Ok(AppConfig {
         app_id: 0,
         webhook_secret: String::new(),
+        private_key_pem: String::new(),
         forks: vec![],
     })
 }
@@ -147,18 +156,24 @@ fn config_path() -> Option<PathBuf> {
 
 /// Build the reconcile dispatcher for the webhook.
 ///
-/// On a valid event, looks up the affected fork (by `owner/name`) among the
-/// configured forks and logs the reconcile request. Full engine execution —
-/// resolving the fork's local mirror, minting an install token, fetching PR
-/// heads, and running `reconcile` — is wired here once the local-repo layout is
-/// configured; for now the fork resolution and event path are exercised.
-fn make_dispatcher(forks: Vec<ForkConfig>) -> impl Fn(String) + Send + Sync + Clone + 'static {
-    move |full_name: String| match forks.iter().find(|f| f.fork.slug() == full_name) {
-        Some(f) => tracing::info!(
-            fork = %full_name,
-            upstream = %f.upstream,
-            "reconcile requested for fork",
-        ),
-        None => tracing::warn!(fork = %full_name, "event for unconfigured fork; ignored"),
+/// On a valid event for a configured fork, spawns a background reconcile of
+/// that fork (live discovery + full engine). Fork events fire only for repos
+/// the app is installed on, so matching the payload's `owner/name` against the
+/// configured forks is the right gate.
+fn make_dispatcher(
+    app: Option<AppCredentials>,
+    forks: Vec<ForkConfig>,
+) -> impl Fn(String) + Send + Sync + Clone + 'static {
+    move |full_name: String| {
+        let Some(fork) = forks.iter().find(|f| f.fork.slug() == full_name).cloned() else {
+            tracing::warn!(fork = %full_name, "event for unconfigured fork; ignored");
+            return;
+        };
+        tracing::info!(fork = %full_name, "reconcile requested for fork");
+        let app = app.clone();
+        tokio::spawn(async move {
+            let outcome = crate::reconcile_fork(app, fork.clone()).await;
+            crate::log_outcome(&fork, outcome);
+        });
     }
 }

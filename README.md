@@ -104,8 +104,6 @@ fork content must live on a stack branch.
       `config.json`), resolve the affected fork and request a reconcile
 - [x] Unit tests (12): signature valid/tampered/wrong-secret, event mapping,
       dispatch outcomes, handler status codes + dispatch invocation
-- [ ] (Not yet) Wire webhook dispatch to the full engine (install token + local
-      mirror + `reconcile`)
 
 **Milestone 8 — Upstream-drift poll loop** ✅
 
@@ -130,11 +128,29 @@ milestone closes that gap with a poll loop.
       advanced/up-to-date/diverged/error, per-fork error isolation, and
       `reconcile_fork` end-to-end over local bare repos
 
+**Milestone 9 — full-engine live wiring** ✅ (webhook + poll drive discovery)
+
+Both the webhook dispatcher and the poll loop now drive the *full* engine for a
+fork: app auth -> live open-PR discovery -> PR-head fetch -> sync upstream ->
+compose artifact.
+
+- [x] `config::ForkConfig::fork_owned_branch`: the fork's persistent overlay
+      branch (bottom stack layer); `Repo::authed_https_url(token)` for
+      x-access-token-authenticated git access
+- [x] `config::AppConfig::private_key_pem` + `credentials()` -> `AppCredentials`
+- [x] `reconcile::reconcile_discovered`: the testable core — discover the
+      ordered stack from PRs, fetch PR heads into the mirror, then `reconcile`
+- [x] `reconcile::reconcile_fork_live`: async end-to-end — install client +
+      token, `live_prs()`, then the blocking git phase on a worker thread
+- [x] `main.rs`: webhook dispatcher and poll loop both call the live reconcile;
+      missing credentials / local mirror => `Failed`, not a crash
+- [x] Unit tests (2 integration): `reconcile_discovered` layers PRs + fork-owned
+      over upstream over local bare repos (with and without a fork-owned branch)
+
 **Up next**
 
 - [ ] Stack cascade-rebase (behind `Rebase` trait; gix rebase is "idea" stage)
-- [ ] Wire webhook reconcile + poll stack to live open-PR discovery (install
-      token + local mirror + discovered stack)
+- [ ] Push the recomposed artifact + mirror back to the fork (write side)
 
 ## Project layout
 
@@ -144,6 +160,7 @@ src/
   config.rs        — fork config (upstream, fork, mirror branch derivation)
   webhook.rs       — GitHub webhook signature verification + event dispatch
   poll.rs          — upstream-drift poll loop (scheduling + outcome classify)
+  reconcile.rs     — live reconcile orchestration (discovery + fetch + engine)
   github/
     mod.rs         — module root + re-exports
     discovery.rs   — open-PR stack discovery (ordering logic) + live PR fetch

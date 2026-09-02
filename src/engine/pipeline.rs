@@ -153,6 +153,7 @@ mod tests {
             default_branch: "main".into(),
             local_mirror: None,
             override_upstream_branch: None,
+            fork_owned_branch: None,
         }
     }
 

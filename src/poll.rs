@@ -79,7 +79,7 @@ where
 ///   and produces the same artifact);
 /// - the mirror is diverged -> we refuse to rewrite it (fast-forward-only), but
 ///   the artifact is still recomposed, so this is a `Changed` with a warning.
-fn classify(result: Result<ReconcileOutcome>) -> PollOutcome {
+pub fn classify(result: Result<ReconcileOutcome>) -> PollOutcome {
     match result {
         Ok(outcome) => match outcome.sync.ff {
             FfOutcome::UpToDate => PollOutcome::NoChange,
@@ -133,6 +133,7 @@ mod tests {
             default_branch: "main".into(),
             local_mirror: None,
             override_upstream_branch: None,
+            fork_owned_branch: None,
         }
     }
 

@@ -36,6 +36,16 @@ impl Repo {
     pub fn https_url(&self) -> String {
         format!("https://github.com/{}/{}.git", self.owner, self.name)
     }
+
+    /// The HTTPS URL for `owner/name` authenticated as a GitHub App
+    /// x-access-token. This is what a git fetch/clone over HTTPS uses when the
+    /// app holds a short-lived installation access token for the repository.
+    pub fn authed_https_url(&self, token: &str) -> String {
+        format!(
+            "https://x-access-token:{token}@github.com/{}/{}.git",
+            self.owner, self.name
+        )
+    }
 }
 
 impl std::fmt::Display for Repo {
@@ -65,6 +75,12 @@ pub struct ForkConfig {
     /// the fork's default branch name.
     #[serde(default)]
     pub override_upstream_branch: Option<String>,
+    /// The name of the fork's persistent overlay branch (e.g. `fork-owned`),
+    /// the bottom layer of the artifact stack. When present it carries the
+    /// fork's own files (`.github/`, packaging tweaks, etc.) that must survive
+    /// recompose. Discovered PRs are layered on top of it.
+    #[serde(default)]
+    pub fork_owned_branch: Option<String>,
 }
 
 fn default_branch_default() -> String {
@@ -95,9 +111,26 @@ pub struct AppConfig {
     pub app_id: u64,
     /// GitHub App webhook secret used to verify webhook payload signatures.
     pub webhook_secret: String,
+    /// The GitHub App's RSA private key (PEM), used to mint JWTs and, from
+    /// there, installation access tokens for the maintained forks.
+    #[serde(default)]
+    pub private_key_pem: String,
     /// The forks this app maintains.
     #[serde(default)]
     pub forks: Vec<ForkConfig>,
+}
+
+impl AppConfig {
+    /// The app identity derived from this config, when a private key is present.
+    pub fn credentials(&self) -> Option<crate::github::auth::AppCredentials> {
+        if self.private_key_pem.is_empty() {
+            return None;
+        }
+        Some(crate::github::auth::AppCredentials {
+            app_id: self.app_id,
+            private_key_pem: self.private_key_pem.clone(),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -120,6 +153,7 @@ mod tests {
             default_branch: "main".into(),
             local_mirror: None,
             override_upstream_branch: None,
+            fork_owned_branch: None,
         };
         // The knob: fork default branch "main" tracks upstream/main.
         assert_eq!(cfg.upstream_branch(), "main");
@@ -147,6 +181,7 @@ mod tests {
             default_branch: "v5".into(),
             local_mirror: None,
             override_upstream_branch: None,
+            fork_owned_branch: None,
         };
         assert_eq!(cfg.upstream_branch(), "v5");
         assert_eq!(cfg.mirror_branch(), "upstream/v5");
@@ -160,6 +195,7 @@ mod tests {
             default_branch: "main".into(),
             local_mirror: None,
             override_upstream_branch: Some("canonical".into()),
+            fork_owned_branch: None,
         };
         assert_eq!(cfg.upstream_branch(), "canonical");
         assert_eq!(cfg.mirror_branch(), "upstream/canonical");
