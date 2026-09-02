@@ -7,7 +7,8 @@ in sync and their patch stacks clean.
 
 The fork's **default branch name** is the *knob*: it selects which upstream
 branch to track. The default branch **contents** are the *artifact*:
-upstream base tree + applied patch stack + fork-owned files.
+upstream base tree + an ordered stack of fork branches (the fork's persistent
+overlays and its patch PRs).
 
 Two branches the engine maintains:
 
@@ -29,24 +30,26 @@ pointing at an upstream branch whose name differs from the fork's default.
 - [x] Fetch upstream over the git transport (`engine::fetch`, `file://` in tests)
 - [x] End-to-end mirror sync (`engine::sync::sync_mirror`: fetch + fast-forward)
 
-**Milestone 2 — Tree composition (artifact half)** ✅ (fork-owned preserve)
-
-- [x] Fork-owned file detection (`engine::compose::fork_owned_files`)
-- [x] Artifact recomposition (`engine::compose::compose_artifact`): overlay fork-owned
-      files onto a new upstream base
-- [x] Local bare-repo tests for detection and preservation
-
-**Milestone 3 — Patch stack overlay** ✅ (tree overlay on the base)
+**Milestone 2 — Artifact composition** ✅ (uniform stack overlay)
 
 - [x] Path-level change enumeration (`engine::stack::patch_changes`, rewrites disabled)
 - [x] Change application (`engine::stack::apply_changes`)
-- [x] Stack cascade (`engine::stack::apply_patch_stack`): layer ordered patch
-      diffs onto a base and write the stacked artifact
-- [x] Local bare-repo tests (add/remove/modify, empty stack, multi-patch cascade)
+- [x] Artifact composition (`engine::stack::compose`): reset `<X>` to the upstream
+      mirror tip, then layer an ordered stack of fork branches on top —
+      the fork's persistent overlays (e.g. `.github/`) are just the bottom
+      layer of that stack
+- [x] Local bare-repo tests (add/remove/modify, empty stack, full artifact with a
+      fork-owned layer + patches, and ad-hoc edits on `<X>` being discarded on
+      recompose)
+
+**Design note:** fork-owned files are *not* a separate mechanism — they are
+just another stacked branch (conceptually an open PR against `upstream/<X>`
+that is never merged upstream). Because `<X>` is rebuilt from the upstream base
+every cycle, ad-hoc manual edits made directly on `<X>` are discarded; persistent
+fork content must live on a stack branch.
 
 **Up next**
 
-- [ ] Full artifact pipeline: compose fork-owned overlay **and** patch stack together
 - [ ] Stack cascade-rebase (behind `Rebase` trait; gix rebase is "idea" stage)
 - [ ] GitHub App wiring (webhooks, installation tokens, open-PR discovery)
 
@@ -61,8 +64,7 @@ src/
     mod.rs       — git engine root
     sync.rs      — fast-forward mirror ref + sync_mirror orchestration
     fetch.rs     — fetch upstream over the git transport (remote/explicit refspec)
-    compose.rs   — fork-owned file detection + artifact tree composition
-    stack.rs     — patch stack overlay (path changes + cascade onto a base)
+    stack.rs     — artifact composition (path changes + branch-stack overlay)
 ```
 
 ## Development

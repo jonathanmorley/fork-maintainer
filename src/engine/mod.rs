@@ -11,7 +11,6 @@
 //! - `<X>` — the recomposed artifact: upstream base tree + patch stack + fork
 //!   owned files. Hosts fork workflows and release tags.
 
-pub mod compose;
 pub mod fetch;
 pub mod stack;
 pub mod sync;

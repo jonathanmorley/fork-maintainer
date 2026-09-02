@@ -1,20 +1,24 @@
-//! Patch stack overlay — the *stack* half of the composed artifact (milestone 4).
+//! Artifact composition — the fork's default branch as a uniform stack overlay.
 //!
-//! The fork's artifact is **upstream base tree + patch stack + fork-owned
-//! files**. The fork-owned overlay lives in [`compose`](super::compose); this
-//! module layers the *patch stack* on top of a base.
+//! The fork's artifact `<X>` is **upstream base tree + an ordered stack of
+//! fork branches**, rebased onto the upstream mirror tip. There is no special
+//! notion of "fork-owned files" as a separate mechanism: a fork's persistent
+//! overlays — its `.github/` workflows, release scripts, fork-specific docs —
+//! are just *another branch in the stack* (conceptually an open PR against
+//! `upstream/<X>` that is never merged upstream). It is the bottom layer.
 //!
-//! A *patch* is a branch whose changes belong in the fork's artifact. Patches
-//! form a cascade: `P1` targets the upstream base, `P2` builds on `P1`, and so
-//! on. To recompose the artifact, we take each patch's changes *relative to its
-//! own base* and re-apply them, in order, onto the running composed tree.
+//! Composition is therefore one uniform operation: take the upstream base and
+//! layer each branch's changes on top, in order. Because we build the artifact
+//! fresh from the upstream base every cycle, the branch is effectively *reset*
+//! to upstream — any ad-hoc edits made directly on `<X>` are discarded and
+//! must instead be made on a stack branch.
 //!
 //! # Seam
 //!
-//! Which branches actually form the patch stack, and in what order, is decided
-//! upstream of this module (discovered from open PRs by the GitHub layer, or
-//! supplied explicitly). This module only needs an ordered list of refs and the
-//! base ref; it is pure git and fully testable against local bare repositories.
+//! Which branches form the stack, and in what order, is decided upstream of
+//! this module (discovered from open PRs by the GitHub layer, or supplied
+//! explicitly). This module only needs an ordered list of refs and the base
+//! ref; it is pure git and fully testable against local bare repositories.
 //!
 //! # Semantics
 //!
@@ -145,47 +149,54 @@ pub fn apply_changes(
     Ok(editor.write()?.detach())
 }
 
-/// The outcome of composing a patch stack onto a base.
+/// The outcome of composing a branch stack onto a base.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StackOutcome {
     /// The final composed tree id.
     pub tree: gix::ObjectId,
     /// The stack artifact commit id.
     pub commit: gix::ObjectId,
-    /// The number of patches that were layered onto the base.
+    /// The number of stack branches that were layered onto the base.
     pub patches_applied: usize,
 }
 
-/// Recompose a patch stack onto `base_ref` and point `target_ref` at the
+/// Compose the artifact `<X>` from an ordered stack of fork branches layered
+/// on `base_ref` (the `upstream/<X>` mirror), and point `target_ref` at the
 /// result.
 ///
-/// `patches` is an ordered list of refs forming the cascade. Each patch's
-/// changes are computed relative to the *previous* layer —
-/// `[base_ref] -> patches[0] -> patches[1] -> …` — and applied in sequence onto
-/// the running composed tree. A new commit is written whose parent is `base_ref`
-///'s commit, and `target_ref` is advanced to it.
+/// This is the single artifact-composition entry point. `branches` is an
+/// ordered list of refs forming the cascade — the fork-owned branch first,
+/// then the patch PRs. Each branch's changes are computed relative to the
+/// *previous* layer — `[base_ref] -> branches[0] -> branches[1] -> …` — and
+/// applied in sequence onto the running composed tree, which starts as the
+/// `base_ref` tree (i.e. `<X>` is reset to upstream). A new commit is written
+/// whose parent is `base_ref`'s commit, and `target_ref` is advanced to it.
+///
+/// Because the tree is rebuilt from `base_ref` every cycle, ad-hoc edits made
+/// directly on the artifact are discarded; persistent fork content must live
+/// on a stack branch.
 ///
 /// # Errors
 ///
-/// Returns an [`anyhow::Error`] if a patch ref or the base ref cannot be
+/// Returns an [`anyhow::Error`] if a branch ref or the base ref cannot be
 /// resolved, or if the tree editor fails.
-pub fn apply_patch_stack(
+pub fn compose(
     repo: &Repository,
     base_ref: &str,
-    patches: &[String],
+    branches: &[String],
     target_ref: &str,
     committer: gix::actor::SignatureRef<'_>,
 ) -> Result<StackOutcome> {
     let (base_tree_id, base_commit) = peel_tree_and_commit(repo, base_ref)?;
     let mut running = base_tree_id;
 
-    // Each layer compares the previous ref's tree against the current patch's
+    // Each layer compares the previous ref's tree against the current branch's
     // tree, then re-applies those changes onto the running composed tree.
     let mut prev_ref = base_ref.to_string();
-    for patch in patches {
-        let changes = patch_changes(repo, &prev_ref, patch)?;
+    for branch in branches {
+        let changes = patch_changes(repo, &prev_ref, branch)?;
         running = apply_changes(repo, running, &changes)?;
-        prev_ref = patch.clone();
+        prev_ref = branch.clone();
     }
 
     let commit = repo
@@ -193,8 +204,8 @@ pub fn apply_patch_stack(
             committer,
             committer,
             format!(
-                "Recompose artifact with patch stack ({} patches)",
-                patches.len()
+                "Recompose artifact from {} stack branches",
+                branches.len()
             ),
             running,
             [base_commit],
@@ -206,7 +217,7 @@ pub fn apply_patch_stack(
     Ok(StackOutcome {
         tree: running,
         commit,
-        patches_applied: patches.len(),
+        patches_applied: branches.len(),
     })
 }
 
@@ -386,7 +397,7 @@ mod tests {
     }
 
     #[test]
-    fn layers_patch_stack_onto_base() {
+    fn compose_full_artifact_from_stack() {
         let dir = temp_dir("stack");
         let repo = init_bare(&dir);
 
@@ -394,31 +405,63 @@ mod tests {
         let base = commit_with_files(&repo, &[("a.txt", "a1")], "base", None);
         set_ref(&repo, "refs/heads/upstream/main", base);
 
-        // P1 targets the base, touching b.txt (adds helper.txt).
-        let p1 = commit_with_files(&repo, &[("a.txt", "a1"), ("helper.txt", "h")], "P1", Some(base));
+        // Fork-owned branch: the fork's persistent overlays (its bottom layer
+        // of the stack, conceptually an open PR that is never merged upstream).
+        let owned = commit_with_files(
+            &repo,
+            &[("a.txt", "a1"), (".github/ci.yml", "workflow")],
+            "owned",
+            Some(base),
+        );
+        set_ref(&repo, "refs/heads/fork-owned", owned);
+
+        // P1 targets the fork-owned layer, adding helper.txt.
+        let p1 = commit_with_files(
+            &repo,
+            &[
+                ("a.txt", "a1"),
+                (".github/ci.yml", "workflow"),
+                ("helper.txt", "h"),
+            ],
+            "P1",
+            Some(owned),
+        );
         set_ref(&repo, "refs/heads/patch/1", p1);
 
         // P2 builds on P1, adding feature.txt and modifying a.txt.
         let p2 = commit_with_files(
             &repo,
-            &[("a.txt", "a2"), ("helper.txt", "h"), ("feature.txt", "f")],
+            &[
+                ("a.txt", "a2"),
+                (".github/ci.yml", "workflow"),
+                ("helper.txt", "h"),
+                ("feature.txt", "f"),
+            ],
             "P2",
             Some(p1),
         );
         set_ref(&repo, "refs/heads/patch/2", p2);
 
-        let patches = vec!["refs/heads/patch/1".to_string(), "refs/heads/patch/2".to_string()];
-        let outcome = apply_patch_stack(
+        let branches = vec![
+            "refs/heads/fork-owned".to_string(),
+            "refs/heads/patch/1".to_string(),
+            "refs/heads/patch/2".to_string(),
+        ];
+        let outcome = compose(
             &repo,
             "refs/heads/upstream/main",
-            &patches,
+            &branches,
             "refs/heads/main",
             sig(),
         )
         .expect("compose stack");
 
-        assert_eq!(outcome.patches_applied, 2);
-        // Final tree carries the cumulative patch changes.
+        assert_eq!(outcome.patches_applied, 3);
+        // Final tree carries the fork-owned overlay AND the cumulative patches.
+        assert_eq!(
+            tree_blob(&repo, outcome.tree, ".github/ci.yml").as_deref(),
+            Some("workflow")
+        );
         assert_eq!(tree_blob(&repo, outcome.tree, "a.txt").as_deref(), Some("a2"));
         assert_eq!(tree_blob(&repo, outcome.tree, "helper.txt").as_deref(), Some("h"));
         assert_eq!(
@@ -430,6 +473,75 @@ mod tests {
     }
 
     #[test]
+    fn recompose_discards_adhoc_edits_on_artifact() {
+        let dir = temp_dir("reset_artifact");
+        let repo = init_bare(&dir);
+
+        // Upstream base.
+        let base = commit_with_files(&repo, &[("a.txt", "a1")], "base", None);
+        set_ref(&repo, "refs/heads/upstream/main", base);
+
+        // Fork-owned branch (the only stack member).
+        let owned = commit_with_files(
+            &repo,
+            &[("a.txt", "a1"), (".github/ci.yml", "workflow")],
+            "owned",
+            Some(base),
+        );
+        set_ref(&repo, "refs/heads/fork-owned", owned);
+
+        let branches = vec!["refs/heads/fork-owned".to_string()];
+        let first = compose(
+            &repo,
+            "refs/heads/upstream/main",
+            &branches,
+            "refs/heads/main",
+            sig(),
+        )
+        .expect("first compose");
+        assert_eq!(
+            tree_blob(&repo, first.tree, ".github/ci.yml").as_deref(),
+            Some("workflow")
+        );
+
+        // Someone hand-edits the artifact directly: adds scratch.txt (an ad-hoc
+        // manual change that is NOT in any stack branch).
+        let scratch = commit_with_files(
+            &repo,
+            &[
+                ("a.txt", "a1"),
+                (".github/ci.yml", "workflow"),
+                ("scratch.txt", "manual"),
+            ],
+            "manual edit",
+            Some(first.commit),
+        );
+        set_ref(&repo, "refs/heads/main", scratch);
+        assert!(tree_has_entry(
+            &repo,
+            repo.find_commit(scratch).unwrap().tree_id().unwrap().detach(),
+            "scratch.txt"
+        ));
+
+        // Recompose: because the artifact is rebuilt from upstream + stack,
+        // the ad-hoc scratch.txt is wiped (it is not on any stack branch).
+        let second = compose(
+            &repo,
+            "refs/heads/upstream/main",
+            &branches,
+            "refs/heads/main",
+            sig(),
+        )
+        .expect("recompose");
+        assert!(!tree_has_entry(&repo, second.tree, "scratch.txt"));
+        assert_eq!(
+            tree_blob(&repo, second.tree, ".github/ci.yml").as_deref(),
+            Some("workflow")
+        );
+        assert_eq!(ref_id(&repo, "refs/heads/main"), Some(second.commit));
+    }
+
+    #[test]
     fn empty_stack_just_rebases_to_base_tree() {
         let dir = temp_dir("empty_stack");
         let repo = init_bare(&dir);
@@ -437,7 +549,7 @@ mod tests {
         let base = commit_with_files(&repo, &[("a.txt", "a1")], "base", None);
         set_ref(&repo, "refs/heads/upstream/main", base);
 
-        let outcome = apply_patch_stack(
+        let outcome = compose(
             &repo,
             "refs/heads/upstream/main",
             &[],
