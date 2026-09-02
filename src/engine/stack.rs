@@ -78,13 +78,24 @@ pub fn patch_changes(
 ) -> Result<Vec<PathChange>> {
     let from_tree = tree_at_ref(repo, from_ref)?;
     let to_tree = tree_at_ref(repo, to_ref)?;
+    tree_changes(&from_tree, &to_tree)
+}
 
+/// Diff two trees, producing deterministic path-level [`PathChange`]s.
+///
+/// With rewrite tracking disabled this yields clean upsert/remove events;
+/// intermediate tree entries (directories) are dropped since their leaf
+/// entries are reported separately.
+fn tree_changes(
+    from_tree: &gix::Tree<'_>,
+    to_tree: &gix::Tree<'_>,
+) -> Result<Vec<PathChange>> {
     let mut changes = Vec::new();
     let mut platform = from_tree.changes()?;
     platform.options(|opts| {
         opts.track_rewrites(None);
     });
-    platform.for_each_to_obtain_tree(&to_tree, |change| {
+    platform.for_each_to_obtain_tree(to_tree, |change| {
         use gix::object::tree::diff::Change::*;
         match change {
             Addition {
@@ -166,11 +177,17 @@ pub struct StackOutcome {
 ///
 /// This is the single artifact-composition entry point. `branches` is an
 /// ordered list of refs forming the cascade — the fork-owned branch first,
-/// then the patch PRs. Each branch's changes are computed relative to the
-/// *previous* layer — `[base_ref] -> branches[0] -> branches[1] -> …` — and
-/// applied in sequence onto the running composed tree, which starts as the
-/// `base_ref` tree (i.e. `<X>` is reset to upstream). A new commit is written
-/// whose parent is `base_ref`'s commit, and `target_ref` is advanced to it.
+/// then the patch PRs.
+///
+/// Each branch's changes are computed against its **own base** — the tree of
+/// its head commit's first parent — rather than against the running tree.
+/// This is what makes the overlay correct when upstream has advanced: files
+/// that upstream added *after* a branch forked are not misread as deletions
+/// the branch made. The branch's own edits (additions, deletions, and
+/// modifications of files present at its fork point) are re-applied, in order,
+/// onto the running composed tree, which starts as the `base_ref` tree (i.e.
+/// `<X>` is reset to upstream). A new commit is written whose parent is
+/// `base_ref`'s commit, and `target_ref` is advanced to it.
 ///
 /// Because the tree is rebuilt from `base_ref` every cycle, ad-hoc edits made
 /// directly on the artifact are discarded; persistent fork content must live
@@ -190,13 +207,21 @@ pub fn compose(
     let (base_tree_id, base_commit) = peel_tree_and_commit(repo, base_ref)?;
     let mut running = base_tree_id;
 
-    // Each layer compares the previous ref's tree against the current branch's
-    // tree, then re-applies those changes onto the running composed tree.
-    let mut prev_ref = base_ref.to_string();
     for branch in branches {
-        let changes = patch_changes(repo, &prev_ref, branch)?;
+        // The branch head commit's own base tree (first-parent) is what the
+        // branch was forked from; diff against it so upstream-only changes
+        // made after the fork are not attributed to the branch.
+        let (head_tree, head_oid) = peel_tree_and_commit(repo, branch)?;
+        let head = repo.find_commit(head_oid)?;
+        let branch_base = match head.parent_ids().next() {
+            Some(parent) => repo.find_commit(parent)?.tree_id()?.detach(),
+            None => repo.empty_tree().id,
+        };
+
+        let from_tree = repo.find_tree(branch_base)?;
+        let to_tree = repo.find_tree(head_tree)?;
+        let changes = tree_changes(&from_tree, &to_tree)?;
         running = apply_changes(repo, running, &changes)?;
-        prev_ref = branch.clone();
     }
 
     let commit = repo
@@ -539,6 +564,53 @@ mod tests {
             Some("workflow")
         );
         assert_eq!(ref_id(&repo, "refs/heads/main"), Some(second.commit));
+    }
+
+    #[test]
+    fn upstream_advance_does_not_become_branch_deletion() {
+        let dir = temp_dir("upstream_advance");
+        let repo = init_bare(&dir);
+
+        // Upstream: c1 has a.txt, then advances to c2 adding b.txt — i.e. the
+        // fork-owned branch is forked from the *older* c1 base.
+        let c1 = commit_with_files(&repo, &[("a.txt", "a1")], "upstream c1", None);
+        set_ref(&repo, "refs/heads/upstream/main", c1);
+        let c2 = commit_with_files(
+            &repo,
+            &[("a.txt", "a1"), ("b.txt", "b2")],
+            "upstream c2",
+            Some(c1),
+        );
+        set_ref(&repo, "refs/heads/upstream/main", c2);
+
+        // Fork-owned branch forked from c1: adds .github/ci.yml, does NOT have
+        // b.txt (it predates c2).
+        let owned = commit_with_files(
+            &repo,
+            &[("a.txt", "a1"), (".github/ci.yml", "workflow")],
+            "owned",
+            Some(c1),
+        );
+        set_ref(&repo, "refs/heads/fork-owned", owned);
+
+        let branches = vec!["refs/heads/fork-owned".to_string()];
+        let outcome = compose(
+            &repo,
+            "refs/heads/upstream/main", // mirror is already advanced to c2
+            &branches,
+            "refs/heads/main",
+            sig(),
+        )
+        .expect("compose");
+
+        // b.txt was added upstream after the fork; it is NOT a deletion the
+        // branch made, so it survives. The fork-owned layer adds .github/ci.yml.
+        assert_eq!(tree_blob(&repo, outcome.tree, "a.txt").as_deref(), Some("a1"));
+        assert_eq!(tree_blob(&repo, outcome.tree, "b.txt").as_deref(), Some("b2"));
+        assert_eq!(
+            tree_blob(&repo, outcome.tree, ".github/ci.yml").as_deref(),
+            Some("workflow")
+        );
     }
 
     #[test]

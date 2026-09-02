@@ -42,6 +42,16 @@ pointing at an upstream branch whose name differs from the fork's default.
       fork-owned layer + patches, and ad-hoc edits on `<X>` being discarded on
       recompose)
 
+**Milestone 3 — Reconcile pipeline** ✅ (config + sync + compose in one pass)
+
+- [x] `engine::pipeline::reconcile`: sync the `upstream/<X>` mirror (fetch +
+      fast-forward), then compose the artifact on top of the freshly synced tip
+- [x] Stack branch changes are diffed against each branch's **own fork point**
+      (first-parent), so files upstream adds after a branch forks are not
+      misread as branch deletions
+- [x] Derived refs from `ForkConfig` (mirror, tracking, artifact; respects
+      `override_upstream_branch`); end-to-end tests wired to config
+
 **Design note:** fork-owned files are *not* a separate mechanism — they are
 just another stacked branch (conceptually an open PR against `upstream/<X>`
 that is never merged upstream). Because `<X>` is rebuilt from the upstream base
@@ -65,6 +75,7 @@ src/
     sync.rs      — fast-forward mirror ref + sync_mirror orchestration
     fetch.rs     — fetch upstream over the git transport (remote/explicit refspec)
     stack.rs     — artifact composition (path changes + branch-stack overlay)
+    pipeline.rs  — reconcile: config-derived sync + compose in one pass
 ```
 
 ## Development

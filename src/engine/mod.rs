@@ -12,5 +12,6 @@
 //!   owned files. Hosts fork workflows and release tags.
 
 pub mod fetch;
+pub mod pipeline;
 pub mod stack;
 pub mod sync;
