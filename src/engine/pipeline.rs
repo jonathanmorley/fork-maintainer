@@ -274,4 +274,77 @@ mod tests {
         assert_eq!(ref_id(&fork, "refs/heads/main"), Some(outcome.compose.commit));
         assert!(!tree_has_entry(&fork, outcome.compose.tree, "nope.txt"));
     }
+
+    #[test]
+    fn reconcile_uses_discovered_pr_stack() {
+        // The full seam: GitHub PR metadata -> discover_stack -> reconcile ->
+        // a composed artifact. Open PR branches are made present locally as
+        // refs/pull/<n>/head, mirroring how a deployment would fetch them.
+        let upstream_dir = temp_dir("pipe_discover_up");
+        let upstream = init_bare(&upstream_dir);
+        let c1 = commit_with_files(&upstream, &[("a.txt", "a1")], "upstream c1", None);
+        set_ref(&upstream, "refs/heads/main", c1);
+
+        let fork_dir = temp_dir("pipe_discover_fork");
+        let fork = init_bare(&fork_dir);
+
+        // Fork-owned branch present locally.
+        let owned = commit_with_files(
+            &fork,
+            &[("a.txt", "a1"), (".github/ci.yml", "workflow")],
+            "owned",
+            Some(c1),
+        );
+        set_ref(&fork, "refs/heads/fork-owned", owned);
+
+        // Open PR 12 (feat-a) based on upstream main; fetched into its pull ref.
+        let pr12 = commit_with_files(
+            &fork,
+            &[("a.txt", "a1"), ("feat.txt", "f")],
+            "feat-a",
+            Some(c1),
+        );
+        set_ref(&fork, "refs/pull/12/head", pr12);
+
+        // Discovery: the fork's open PRs plus its fork-owned branch.
+        let prs = vec![crate::github::PrInfo {
+            number: 12,
+            head_branch: "feat-a".into(),
+            base_branch: "main".into(),
+        }];
+        let stack =
+            crate::github::discover_stack("main", Some("fork-owned"), &prs).expect("discover");
+        assert_eq!(
+            stack,
+            vec![
+                "refs/heads/fork-owned".to_string(),
+                "refs/pull/12/head".to_string()
+            ]
+        );
+
+        let outcome = reconcile(
+            &fork,
+            &cfg(),
+            "main",
+            &upstream_dir.display().to_string(),
+            &stack,
+            sig(),
+        )
+        .expect("reconcile");
+
+        // Artifact carries the fork-owned layer AND the PR's change.
+        assert_eq!(
+            tree_blob(&fork, outcome.compose.tree, ".github/ci.yml").as_deref(),
+            Some("workflow")
+        );
+        assert_eq!(
+            tree_blob(&fork, outcome.compose.tree, "feat.txt").as_deref(),
+            Some("f")
+        );
+        assert_eq!(
+            tree_blob(&fork, outcome.compose.tree, "a.txt").as_deref(),
+            Some("a1")
+        );
+        assert_eq!(ref_id(&fork, "refs/heads/main"), Some(outcome.compose.commit));
+    }
 }

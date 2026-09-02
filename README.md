@@ -52,6 +52,16 @@ pointing at an upstream branch whose name differs from the fork's default.
 - [x] Derived refs from `ForkConfig` (mirror, tracking, artifact; respects
       `override_upstream_branch`); end-to-end tests wired to config
 
+**Milestone 4 — Open-PR stack discovery** ✅ (ordering seam, no network)
+
+- [x] `github::discover_stack`: turn a fork's open PRs (head/base) into the
+      ordered stack refs, fork-owned branch first, then PRs topological by
+      base chain (same-level take ascending number); deterministic
+- [x] Errors on unknown bases and PR cycles
+- [x] End-to-end `discover_stack` -> `reconcile` test over a local repo
+- [ ] (Not yet) App identity / installation tokens / live octocrab fetch of
+      open PRs and PR head branches into `refs/pull/<n>/head`
+
 **Design note:** fork-owned files are *not* a separate mechanism — they are
 just another stacked branch (conceptually an open PR against `upstream/<X>`
 that is never merged upstream). Because `<X>` is rebuilt from the upstream base
@@ -61,7 +71,8 @@ fork content must live on a stack branch.
 **Up next**
 
 - [ ] Stack cascade-rebase (behind `Rebase` trait; gix rebase is "idea" stage)
-- [ ] GitHub App wiring (webhooks, installation tokens, open-PR discovery)
+- [ ] GitHub App wiring: identity (JWT/installation tokens), webhooks, live
+      octocrab fetch of open PRs and PR head branches into `refs/pull/<n>/head`
 
 ## Project layout
 
@@ -69,7 +80,7 @@ fork content must live on a stack branch.
 src/
   lib.rs         — library root
   config.rs      — fork config (upstream, fork, mirror branch derivation)
-  github.rs      — GitHub API stub (octocrab — placeholder)
+  github.rs      — open-PR stack discovery (ordering logic; App wiring pending)
   engine/
     mod.rs       — git engine root
     sync.rs      — fast-forward mirror ref + sync_mirror orchestration
