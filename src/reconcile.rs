@@ -107,6 +107,73 @@ pub async fn reconcile_fork_live(
     .context("git reconcile phase panicked")?
 }
 
+/// Reconcile a fork and push the recomposed artifact + mirror back to GitHub.
+///
+/// This is the full end-to-end pipeline: authenticate, discover PRs, fetch,
+/// sync, compose, and push. It combines [`reconcile_fork_live`] with
+/// [`crate::engine::push::push_fork_refs`].
+///
+/// The push happens on the same worker thread as the git phase. If the push
+/// fails (e.g. the remote has been modified), the reconcile outcome is still
+/// returned — the push error is surfaced separately.
+///
+/// # Blocking
+///
+/// The git phase (fetch, sync, compose, push) is blocking I/O; this function
+/// must be called from a worker thread in async contexts.
+pub async fn reconcile_and_push_live(
+    app: &AppCredentials,
+    cfg: &ForkConfig,
+    committer: SignatureRef<'static>,
+) -> Result<(ReconcileOutcome, Option<crate::engine::push::PushResult>)> {
+    let app_client = app.app_client()?;
+    let install =
+        crate::github::auth::install_client(&app_client, &cfg.fork.owner, &cfg.fork.name).await?;
+    let prs = crate::github::discovery::live_prs(&install, &cfg.fork).await?;
+    let token =
+        crate::github::auth::install_https_token(&app_client, &cfg.fork.owner, &cfg.fork.name)
+            .await?;
+
+    let upstream_url = cfg.upstream.https_url();
+    let fork_url = cfg.fork.authed_https_url(&token);
+
+    let fork_cfg = cfg.clone();
+    let local_mirror = cfg
+        .local_mirror
+        .clone()
+        .context("fork has no local_mirror configured")?;
+    let prs = prs.clone();
+
+    tokio::task::spawn_blocking(move || {
+        let repo = open_repo(&local_mirror)?;
+
+        // Phase 1: discover -> fetch -> sync -> compose.
+        let outcome =
+            reconcile_discovered(&repo, &fork_cfg, &upstream_url, &fork_url, &prs, committer)?;
+
+        // Phase 2: push the recomposed artifact and mirror back to the fork.
+        let mirror_ref = format!("refs/heads/{}", fork_cfg.mirror_branch());
+        let artifact_ref = format!("refs/heads/{}", fork_cfg.default_branch);
+        let push_result = crate::engine::push::push_fork_refs(
+            repo.workdir().unwrap_or_else(|| repo.common_dir()),
+            &fork_url,
+            &artifact_ref,
+            &mirror_ref,
+            &fork_cfg.default_branch,
+        );
+
+        match push_result {
+            Ok(push) => Ok((outcome, Some(push))),
+            Err(e) => {
+                tracing::warn!(fork = %fork_cfg.fork, "push failed after reconcile: {e}");
+                Ok((outcome, None))
+            }
+        }
+    })
+    .await
+    .context("git reconcile+push phase panicked")?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

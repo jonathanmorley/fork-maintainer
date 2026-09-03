@@ -150,7 +150,6 @@ compose artifact.
 **Up next**
 
 - [ ] Stack cascade-rebase (behind `Rebase` trait; gix rebase is "idea" stage)
-- [ ] Push the recomposed artifact + mirror back to the fork (write side)
 
 ## Project layout
 
@@ -169,6 +168,7 @@ src/
     mod.rs         — git engine root
     sync.rs        — fast-forward mirror ref + sync_mirror orchestration
     fetch.rs       — fetch upstream / PR-head refs over the git transport
+    push.rs        — push recomposed artifact + mirror back to the fork (git CLI)
     stack.rs       — artifact composition (path changes + branch-stack overlay)
     pipeline.rs    — reconcile: config-derived sync + compose in one pass
   main.rs          — binary: load config, run the webhook server + poll loop
