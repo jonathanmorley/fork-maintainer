@@ -147,6 +147,24 @@ compose artifact.
 - [x] Unit tests (2 integration): `reconcile_discovered` layers PRs + fork-owned
       over upstream over local bare repos (with and without a fork-owned branch)
 
+**Milestone 10 — write side** ✅ (push recomposed artifact + mirror to fork)
+
+The engine now completes the full cycle: after syncing the upstream mirror and
+recomposing the artifact, it pushes both maintained refs back to the fork on
+GitHub so users and CI see the updated artifact and PRs can target the mirror
+ref.
+
+- [x] `engine::push::push_refs`: push refspecs via the git CLI (gix 0.87.1 has
+      no push API in its public API), parse porcelain output to extract pushed
+      refs
+- [x] `engine::push::push_fork_refs`: convenience for the two maintained refs —
+      artifact (`<X>`) and mirror (`upstream/<X>`) pushed to the fork
+- [x] `reconcile::reconcile_and_push_live`: full pipeline — authenticate,
+      discover PRs, fetch, sync, compose, and push on a worker thread; push
+      failures are logged separately without aborting the reconcile outcome
+- [x] Unit tests (6): porcelain output parsing, empty refspec no-op, bad
+      remote, single ref push, fork refs round-trip over local bare repos
+
 **Up next**
 
 - [ ] Stack cascade-rebase (behind `Rebase` trait; gix rebase is "idea" stage)
