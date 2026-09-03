@@ -9,17 +9,38 @@
 //! refs without a working tree.
 
 use anyhow::{Context, Result};
+use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
+
+/// Serializes `ensure_mirror` per mirror path so concurrent reconcile calls
+/// (e.g. a webhook and the poll loop firing for the same fork at once) cannot
+/// both attempt to `git clone` into the same directory.
+static CLONE_LOCKS: OnceLock<Mutex<HashMap<std::path::PathBuf, std::sync::Arc<Mutex<()>>>>> =
+    OnceLock::new();
+
+fn clone_lock_for(path: &Path) -> std::sync::Arc<Mutex<()>> {
+    let map = CLONE_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = map.lock().expect("clone-lock map poisoned");
+    map.entry(path.to_path_buf())
+        .or_insert_with(|| std::sync::Arc::new(Mutex::new(())))
+        .clone()
+}
 
 /// Ensure a bare mirror clone exists at `mirror_path`.
 ///
-/// If `mirror_path` already exists and contains a `.git` directory (or is
-/// itself a bare repo), this is a no-op. Otherwise, clones `remote_url`
-/// as a bare mirror into `mirror_path`.
+/// If `mirror_path` already exists and looks like a bare git repo, this is a
+/// no-op. Otherwise, clones `remote_url` as a bare mirror into `mirror_path`.
 ///
 /// `auth_header` is an optional `Authorization` header value for
 /// authenticated clones (e.g. `Bearer <token>`).
+///
+/// On failure the partially-cloned directory is removed so the next attempt
+/// starts from a clean slate.
+///
+/// Concurrent calls for the same `mirror_path` are serialized so only one
+/// clone runs at a time.
 ///
 /// This is blocking I/O — call from a worker thread in async contexts.
 pub fn ensure_mirror(
@@ -27,6 +48,12 @@ pub fn ensure_mirror(
     remote_url: &str,
     auth_header: Option<&str>,
 ) -> Result<()> {
+    // Serialize concurrent first-boot clones for the same path. Cheap after
+    // the initial healthy check: the check-and-exists happens under the lock.
+    let lock = clone_lock_for(mirror_path);
+    let _guard = lock.lock().expect("clone lock poisoned");
+
+    // Re-check under the lock: another call may have cloned it while we waited.
     // Check if the mirror already exists and looks like a git repo.
     if is_git_repo(mirror_path) {
         tracing::debug!(path = %mirror_path.display(), "mirror already exists");
@@ -60,6 +87,8 @@ pub fn ensure_mirror(
         .with_context(|| format!("failed to execute git clone for {}", mirror_path.display()))?;
 
     if !output.status.success() {
+        // Clean up any partial clone so the next attempt starts fresh.
+        let _ = std::fs::remove_dir_all(mirror_path);
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!("git clone failed for {}: {stderr}", mirror_path.display());
     }
@@ -77,8 +106,14 @@ fn is_git_repo(path: &Path) -> bool {
     if !path.exists() {
         return false;
     }
-    // Bare repo: the path itself is the git directory.
-    if path.join("HEAD").exists() && path.join("objects").exists() {
+    // Bare repo: the path itself is the git directory. Require the core files
+    // a usable bare repo always has, to avoid mistaking a partial clone or an
+    // ad-hoc directory holding just HEAD + objects for a real repo.
+    if path.join("HEAD").exists()
+        && path.join("objects").exists()
+        && path.join("refs").exists()
+        && path.join("config").exists()
+    {
         return true;
     }
     // Non-bare repo: .git directory exists.

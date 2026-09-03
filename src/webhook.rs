@@ -445,6 +445,8 @@ mod tests {
             let server = tokio::spawn(async move {
                 axum::serve(local, router(state)).await.unwrap();
             });
+            // Give the accept loop a moment to be ready before connecting.
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
             stream

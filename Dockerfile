@@ -28,6 +28,9 @@ WORKDIR /home/fork-maintainer
 
 COPY --from=builder /app/target/release/fork-maintainer /usr/local/bin/
 
-EXPOSE 3000
+# Render expects web services to listen on port 10000 by default. The app's
+# default (3000) is overridden in the Render blueprint; keep them in agreement
+# so `docker run -p` matches production.
+EXPOSE 10000
 
 CMD ["fork-maintainer"]

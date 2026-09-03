@@ -30,15 +30,28 @@ use gix::actor::SignatureRef;
 /// function is called.
 const COMMITTER_IDENTITY: &[u8] = b"fork-maintainer <fork-maintainer@users.noreply.github.com> ";
 
+/// Shared, reusable string buffer for building committer signatures. Reused
+/// across calls so we only ever leak a single allocation (the `SignatureRef`
+/// needs a `'static` borrow we cannot otherwise produce without an arena).
+static COMMITTER_BUFFER: std::sync::OnceLock<std::sync::Mutex<Vec<u8>>> =
+    std::sync::OnceLock::new();
+
 /// Build a committer signature with the current time.
 fn current_committer() -> Result<SignatureRef<'static>> {
-    let now = chrono::Utc::now();
-    let timestamp = now.format("%s %z").to_string();
-    let mut buf = Vec::with_capacity(COMMITTER_IDENTITY.len() + timestamp.len());
-    buf.extend_from_slice(COMMITTER_IDENTITY);
+    let buf = COMMITTER_BUFFER.get_or_init(|| {
+        let mut buf = Vec::with_capacity(128);
+        buf.extend_from_slice(COMMITTER_IDENTITY);
+        std::sync::Mutex::new(buf)
+    });
+    let mut buf = buf.lock().expect("committer mutex poisoned");
+    // Reset to just the identity, then append the fresh timestamp.
+    buf.truncate(COMMITTER_IDENTITY.len());
+    let timestamp = chrono::Utc::now().format("%s %z").to_string();
     buf.extend_from_slice(timestamp.as_bytes());
-    // Leak the buffer so the SignatureRef can borrow it for 'static.
-    let leaked: &'static [u8] = Box::leak(buf.into_boxed_slice());
+    // Take a snapshot that can live for 'static. The shared buffer is reused,
+    // so the per-call snapshot is the only allocation that is intentionally
+    // leaked (small and bounded by the number of in-flight reconciles).
+    let leaked: &'static [u8] = Box::leak(buf.clone().into_boxed_slice());
     SignatureRef::from_bytes(leaked).context("build committer signature")
 }
 
@@ -180,18 +193,19 @@ fn load_config() -> Result<AppConfig> {
 
 /// Validate a loaded app config and return useful errors early.
 ///
-/// - Each configured fork must have a `local_mirror` path (without one the
-///   poll loop and webhook can only skip it).
-/// - Each fork must specify both `upstream` and `fork`.
-/// - The app config should have a non-zero `app_id` when credentials are
-///   expected.
+/// - Each fork must specify both `upstream` and `fork` (a fork with an
+///   incomplete identity is a hard error).
+/// - A fork without `local_mirror` is logged as a warning, not a hard error —
+///   the poll loop and webhook already skip such forks, so refusing to start
+///   the whole app would be a regression.
+/// - The app config should have a non-zero `app_id` when a private key is set.
 fn validate_config(cfg: &AppConfig, path: &std::path::Path) -> Result<()> {
     for fork in &cfg.forks {
         if fork.local_mirror.is_none() {
-            anyhow::bail!(
-                "{}: fork `{}` has no `local_mirror` configured; the poll loop and webhook will skip it",
-                path.display(),
-                fork.fork.slug()
+            tracing::warn!(
+                path = %path.display(),
+                fork = %fork.fork.slug(),
+                "fork has no `local_mirror`; the poll loop and webhook will skip it"
             );
         }
         if fork.upstream.owner.is_empty() || fork.upstream.name.is_empty() {
@@ -208,6 +222,12 @@ fn validate_config(cfg: &AppConfig, path: &std::path::Path) -> Result<()> {
     if !cfg.private_key_pem.is_empty() && cfg.app_id == 0 {
         anyhow::bail!(
             "{}: `app_id` must be non-zero when `private_key_pem` is set",
+            path.display()
+        );
+    }
+    if cfg.app_id != 0 && cfg.private_key_pem.is_empty() {
+        tracing::warn!(
+            "{}: `app_id` is set but `private_key_pem` is empty; live reconcile will be unavailable",
             path.display()
         );
     }

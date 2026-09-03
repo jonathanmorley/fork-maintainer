@@ -182,8 +182,9 @@ The app is containerized (see `Dockerfile`) and ships a Render blueprint
    `/data/mirrors/<fork>`).
 3. **Persistent disk** — Render web services reset their filesystem on deploy,
    so the local mirrors must live on a mounted disk. The app clones each fork's
-   bare mirror on first boot (`mirror::ensure_mirror`) and reuses it thereafter;
-   no manual `git clone` setup needed.
+   bare mirror on first boot (`mirror::ensure_mirror`) and reuses it
+   thereafter; no manual `git clone` setup needed. It is concurrency-safe: a
+   webhook and the poll loop firing for the same fork cannot double-clone.
 
 ### Health check
 
