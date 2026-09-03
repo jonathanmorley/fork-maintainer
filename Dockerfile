@@ -12,8 +12,13 @@ COPY . .
 
 RUN cargo build --release
 
-# Runtime stage
-FROM debian:bookworm-slim
+# Runtime stage.
+#
+# IMPORTANT: the runtime base must ship a glibc at least as new as the one the
+# builder links against. `rust:1.95-slim` builds against glibc 2.39+ (Debian
+# 13/trixie era). debian:bookworm-slim ships glibc 2.36 and will fail at
+# runtime with "GLIBC_2.39 not found". Using trixie matches the builder.
+FROM debian:trixie-slim
 
 RUN apt-get update && apt-get install -y \
     ca-certificates \
