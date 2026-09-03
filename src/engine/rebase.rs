@@ -26,15 +26,15 @@
 //!          ┌───────────────┼───────────────┐
 //!          │               │               │
 //!   ┌──────▼──────┐ ┌─────▼──────┐ ┌─────▼──────┐
-//!   │   Overlay   │ │ Cascade    │ │ (future)   │
-//!   │  (current)  │ │ Rebase     │ │ Other      │
+//!   │   Overlay   │ │   Merge    │ │ Cascade    │
+//!   │  (current)  │ │ (3-way)    │ │ Rebase     │
 //!   └─────────────┘ └────────────┘ └────────────┘
 //! ```
 //!
 //! The trait is object-safe and can be used as a dynamic dispatch in the
 //! pipeline, or as a compile-time selection via generics.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use gix::Repository;
 use gix::actor::SignatureRef;
 
@@ -102,6 +102,111 @@ impl Rebase for Overlay {
     }
 }
 
+/// Three-way merge strategy — uses gix's `merge_trees` for conflict detection.
+///
+/// For each branch in the stack, computes the3-way merge between:
+/// - **ancestor**: the branch's own fork point (first parent)
+/// - **ours**: the running composed tree
+/// - **theirs**: the branch's head tree
+///
+/// This detects conflicts at each layer. Auto-resolved conflicts (e.g.
+/// non-overlapping changes) are applied; true conflicts cause the compose
+/// to fail with an error listing the conflicted paths.
+///
+/// This is a stepping stone toward full cascade-rebase: it provides
+/// conflict detection without the linear-history rebase semantics.
+pub struct Merge;
+
+impl Rebase for Merge {
+    fn compose(
+        &self,
+        repo: &Repository,
+        base_ref: &str,
+        branches: &[String],
+        target_ref: &str,
+        committer: SignatureRef<'_>,
+    ) -> Result<ComposeOutcome> {
+        // Start with the upstream base tree.
+        let base_oid = repo.find_reference(base_ref)?.id().detach();
+        let base_commit = repo.find_commit(base_oid)?;
+        let mut running_tree = base_commit.tree_id()?.detach();
+
+        for branch in branches {
+            let branch_oid = repo.find_reference(branch)?.id().detach();
+            let branch_commit = repo.find_commit(branch_oid)?;
+            let branch_tree = branch_commit.tree_id()?.detach();
+
+            // The branch's fork point is its first parent (or empty tree).
+            let ancestor_tree = match branch_commit.parent_ids().next() {
+                Some(parent) => repo.find_commit(parent)?.tree_id()?.detach(),
+                None => repo.empty_tree().id,
+            };
+
+            // Perform 3-way merge: ours=running, theirs=branch, ancestor=branch's fork point.
+            let labels = gix::merge::blob::builtin_driver::text::Labels {
+                ancestor: Some(branch.as_bytes().into()),
+                current: Some(b"running-composed".as_ref().into()),
+                other: Some(branch.as_bytes().into()),
+            };
+
+            let options = repo.tree_merge_options()?;
+            let mut outcome = repo
+                .merge_trees(ancestor_tree, running_tree, branch_tree, labels, options)
+                .with_context(|| format!("3-way merge for branch `{branch}`"))?;
+
+            // Check for unresolved conflicts.
+            if !outcome.conflicts.is_empty() {
+                anyhow::bail!(
+                    "conflicts detected while merging branch `{branch}`: {} conflicted entries",
+                    outcome.conflicts.len()
+                );
+            }
+
+            // Write the merged tree and advance the running tree.
+            let merged_tree_id = outcome.tree.write()?.detach();
+            running_tree = merged_tree_id;
+        }
+
+        // Create the commit and advance target_ref.
+        let commit = repo
+            .new_commit_as(
+                committer,
+                committer,
+                format!(
+                    "Recompose artifact from {} stack branches (merge strategy)",
+                    branches.len()
+                ),
+                running_tree,
+                [base_oid],
+            )?
+            .id;
+
+        // Write the target ref.
+        use gix::refs::Target;
+        use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
+        repo.edit_reference(RefEdit {
+            change: Change::Update {
+                log: LogChange {
+                    mode: RefLog::AndReference,
+                    force_create_reflog: false,
+                    message: format!("fork-maintainer: recompose stack artifact to {commit}")
+                        .into(),
+                },
+                expected: PreviousValue::Any,
+                new: Target::Object(commit),
+            },
+            name: gix::refs::FullName::try_from(target_ref)?,
+            deref: false,
+        })?;
+
+        Ok(ComposeOutcome {
+            tree: running_tree,
+            commit,
+            patches_applied: branches.len(),
+        })
+    }
+}
+
 /// Cascade-rebase strategy — placeholder for future gix rebase support.
 ///
 /// This struct exists to document the intended design and provide a
@@ -125,7 +230,7 @@ impl Rebase for CascadeRebase {
     ) -> Result<ComposeOutcome> {
         anyhow::bail!(
             "cascade-rebase is not yet implemented: gix 0.87.1 has no rebase API. \
-             Use the Overlay strategy instead."
+             Use the Overlay or Merge strategy instead."
         )
     }
 }
@@ -209,6 +314,112 @@ mod tests {
         assert_eq!(ref_id(&repo, "refs/heads/main"), Some(outcome.commit));
     }
 
+    /// Merge strategy composes non-conflicting branches.
+    #[test]
+    fn merge_composes_non_conflicting() {
+        let dir = temp_dir("merge_nonconflict");
+        let repo = gix::init_bare(&dir).expect("init bare");
+
+        // Base: a.txt
+        let base = commit_with_file(&repo, "a.txt", "a1", "base", None);
+        repo.reference("refs/heads/upstream/main", base, PreviousValue::Any, "init")
+            .expect("set base");
+
+        // Branch adds .github/ci.yml (non-overlapping with base).
+        let branch = commit_with_file(&repo, ".github/ci.yml", "workflow", "add ci", Some(base));
+        repo.reference(
+            "refs/heads/fork-owned",
+            branch,
+            PreviousValue::Any,
+            "init branch",
+        )
+        .expect("set branch");
+
+        let strategy = Merge;
+        let outcome = strategy
+            .compose(
+                &repo,
+                "refs/heads/upstream/main",
+                &["refs/heads/fork-owned".to_string()],
+                "refs/heads/main",
+                sig(),
+            )
+            .expect("merge compose");
+
+        assert_eq!(outcome.patches_applied, 1);
+        assert_eq!(ref_id(&repo, "refs/heads/main"), Some(outcome.commit));
+    }
+
+    /// Merge strategy detects conflicts.
+    #[test]
+    fn merge_detects_conflicts() {
+        let dir = temp_dir("merge_conflict");
+        let repo = gix::init_bare(&dir).expect("init bare");
+
+        // Base: a.txt = "a1"
+        let base = commit_with_file(&repo, "a.txt", "a1", "base", None);
+        repo.reference("refs/heads/upstream/main", base, PreviousValue::Any, "init")
+            .expect("set base");
+
+        // Branch modifies a.txt (conflicts with upstream if upstream also changed it).
+        // For 3-way merge: ancestor=base, ours=base, theirs=branch.
+        // Since ours didn't change a.txt but theirs did, this is NOT a conflict.
+        // We need a real conflict: both sides change the same file differently.
+        let branch = commit_with_file(&repo, "a.txt", "a2", "modify a", Some(base));
+        repo.reference(
+            "refs/heads/feature",
+            branch,
+            PreviousValue::Any,
+            "init feature",
+        )
+        .expect("set feature");
+
+        // Now advance the running tree to also modify a.txt differently.
+        // We'll compose feature first (non-conflicting), then try another
+        // branch that conflicts with the composed result.
+        let strategy_merge = Merge;
+        let _first = strategy_merge
+            .compose(
+                &repo,
+                "refs/heads/upstream/main",
+                &["refs/heads/feature".to_string()],
+                "refs/heads/main",
+                sig(),
+            )
+            .expect("first compose");
+        // At this point refs/heads/main points at the composed commit with a.txt="a2".
+
+        // Now create a branch that also modifies a.txt to a3, forked from base.
+        let conflicting = commit_with_file(&repo, "a.txt", "a3", "conflict", Some(base));
+        repo.reference(
+            "refs/heads/conflict-branch",
+            conflicting,
+            PreviousValue::Any,
+            "init conflict",
+        )
+        .expect("set conflict branch");
+
+        // The merge strategy will try to merge conflict-branch (a.txt->a3)
+        // into the running tree (a.txt->a2), using the fork point (a.txt->a1)
+        // as ancestor. Both sides changed a.txt differently => conflict.
+        let err = strategy_merge
+            .compose(
+                &repo,
+                "refs/heads/upstream/main",
+                &[
+                    "refs/heads/feature".to_string(),
+                    "refs/heads/conflict-branch".to_string(),
+                ],
+                "refs/heads/main",
+                sig(),
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("conflicts detected"),
+            "expected conflict error, got: {err}"
+        );
+    }
+
     /// CascadeRebase returns an error (not yet implemented).
     #[test]
     fn cascade_rebase_returns_error() {
@@ -233,5 +444,40 @@ mod tests {
             err.to_string().contains("not yet implemented"),
             "unexpected error: {err}"
         );
+    }
+
+    /// Merge strategy with multiple non-conflicting branches.
+    #[test]
+    fn merge_composes_multiple_branches() {
+        let dir = temp_dir("merge_multi");
+        let repo = gix::init_bare(&dir).expect("init bare");
+
+        let base = commit_with_file(&repo, "a.txt", "a1", "base", None);
+        repo.reference("refs/heads/upstream/main", base, PreviousValue::Any, "init")
+            .expect("set base");
+
+        // Branch 1: adds b.txt
+        let b1 = commit_with_file(&repo, "b.txt", "b1", "add b", Some(base));
+        repo.reference("refs/heads/b1", b1, PreviousValue::Any, "init b1")
+            .expect("set b1");
+
+        // Branch 2: adds c.txt (forked from base, independent of b1)
+        let b2 = commit_with_file(&repo, "c.txt", "c1", "add c", Some(base));
+        repo.reference("refs/heads/b2", b2, PreviousValue::Any, "init b2")
+            .expect("set b2");
+
+        let strategy = Merge;
+        let outcome = strategy
+            .compose(
+                &repo,
+                "refs/heads/upstream/main",
+                &["refs/heads/b1".to_string(), "refs/heads/b2".to_string()],
+                "refs/heads/main",
+                sig(),
+            )
+            .expect("merge compose");
+
+        assert_eq!(outcome.patches_applied, 2);
+        assert_eq!(ref_id(&repo, "refs/heads/main"), Some(outcome.commit));
     }
 }

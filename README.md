@@ -188,7 +188,7 @@ src/
     fetch.rs       — fetch upstream / PR-head refs over the git transport
     push.rs        — push recomposed artifact + mirror back to the fork (git CLI)
     stack.rs       — artifact composition (path changes + branch-stack overlay)
-    rebase.rs      — Rebase trait abstraction for future cascade-rebase support
+    rebase.rs      — Rebase trait: Overlay (current), Merge (3-way), CascadeRebase (future)
     pipeline.rs    — reconcile: config-derived sync + compose in one pass
   main.rs          — binary: load config, run the webhook server + poll loop
 ```
