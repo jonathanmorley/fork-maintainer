@@ -1,5 +1,5 @@
 # Build stage
-FROM rust:1.95-slim as builder
+FROM rust:1.95-slim AS builder
 
 RUN apt-get update && apt-get install -y \
     pkg-config \
