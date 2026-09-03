@@ -109,8 +109,20 @@ async fn reconcile_fork(app: Option<AppCredentials>, fork: ForkConfig) -> PollOu
         return PollOutcome::Failed("fork has no local_mirror configured".into());
     }
     let committer = SignatureRef::from_bytes(COMMITTER).expect("valid committer");
-    let result = fork_maintainer::reconcile::reconcile_fork_live(&app, &fork, committer).await;
-    fork_maintainer::poll::classify(result)
+    let result = fork_maintainer::reconcile::reconcile_and_push_live(&app, &fork, committer).await;
+    match result {
+        Ok((outcome, push)) => {
+            if let Some(push) = push {
+                tracing::info!(
+                    fork = %fork.fork,
+                    pushed = ?push.pushed,
+                    "pushed recomposed artifact to fork"
+                );
+            }
+            fork_maintainer::poll::classify(Ok(outcome))
+        }
+        Err(e) => fork_maintainer::poll::classify(Err(e)),
+    }
 }
 
 /// Log a fork's poll outcome at the appropriate level.
