@@ -100,6 +100,13 @@ pub async fn reconcile_fork_live(
     let prs = prs.clone();
 
     tokio::task::spawn_blocking(move || {
+        // Ensure the local mirror exists (first-boot clone if needed).
+        crate::mirror::ensure_mirror(
+            std::path::Path::new(&local_mirror),
+            &fork_url,
+            None, // Auth is already embedded in fork_url via x-access-token
+        )?;
+
         let repo = open_repo(&local_mirror)?;
         reconcile_discovered(&repo, &fork_cfg, &upstream_url, &fork_url, &prs, committer)
     })
@@ -145,6 +152,13 @@ pub async fn reconcile_and_push_live(
     let prs = prs.clone();
 
     tokio::task::spawn_blocking(move || {
+        // Ensure the local mirror exists (first-boot clone if needed).
+        crate::mirror::ensure_mirror(
+            std::path::Path::new(&local_mirror),
+            &fork_url,
+            None, // Auth is already embedded in fork_url via x-access-token
+        )?;
+
         let repo = open_repo(&local_mirror)?;
 
         // Phase 1: discover -> fetch -> sync -> compose.
@@ -160,6 +174,7 @@ pub async fn reconcile_and_push_live(
             &artifact_ref,
             &mirror_ref,
             &fork_cfg.default_branch,
+            None, // Auth is already embedded in fork_url via x-access-token
         );
 
         match push_result {

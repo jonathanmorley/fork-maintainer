@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.104"
 axum = "0.8.9"
+chrono = "0.4"
 futures = "0.3.34"
 gix = { version = "0.87.1", features = ["blocking-network-client", "blocking-http-transport-curl"] }
 hex = "0.4"

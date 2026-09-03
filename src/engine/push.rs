@@ -41,12 +41,21 @@ pub struct PushResult {
 /// `refs/heads/main:refs/heads/main`). The push uses the `git` CLI because
 /// gix 0.87 does not expose push operations in its public API.
 ///
+/// `auth_header` is an optional `Authorization` header value (e.g.
+/// `Bearer <token>`) set via `git -c http.extraHeader`. When `None`, no
+/// authentication is configured (suitable for local bare repos in tests).
+///
 /// This is blocking I/O — call from a worker thread in async contexts.
 ///
 /// # Errors
 ///
 /// Returns an error if the `git push` command fails or cannot be executed.
-pub fn push_refs(repo_path: &Path, remote_url: &str, refspecs: &[String]) -> Result<PushResult> {
+pub fn push_refs(
+    repo_path: &Path,
+    remote_url: &str,
+    refspecs: &[String],
+    auth_header: Option<&str>,
+) -> Result<PushResult> {
     if refspecs.is_empty() {
         return Ok(PushResult { pushed: vec![] });
     }
@@ -57,6 +66,10 @@ pub fn push_refs(repo_path: &Path, remote_url: &str, refspecs: &[String]) -> Res
         .arg("push")
         .arg("--porcelain")
         .arg(remote_url);
+
+    if let Some(header) = auth_header {
+        cmd.arg("-c").arg(format!("http.extraHeader={header}"));
+    }
 
     for spec in refspecs {
         cmd.arg(spec);
@@ -103,6 +116,9 @@ fn parse_push_output(stdout: &str) -> Vec<String> {
 /// `refs/heads/upstream/main`), and `remote_branch` is the fork's default
 /// branch name on GitHub (e.g. `main`).
 ///
+/// `auth_header` is an optional `Authorization` header value for
+/// authenticated pushes (e.g. `Bearer <token>`).
+///
 /// This pushes:
 /// - `<artifact_ref>` → `refs/heads/<remote_branch>` on the fork
 /// - `<mirror_ref>` → `refs/heads/<mirror_ref_name>` on the fork
@@ -116,12 +132,13 @@ pub fn push_fork_refs(
     artifact_ref: &str,
     mirror_ref: &str,
     remote_branch: &str,
+    auth_header: Option<&str>,
 ) -> Result<PushResult> {
     let artifact_spec = format!("{artifact_ref}:refs/heads/{remote_branch}");
     let mirror_spec = format!("{mirror_ref}:{mirror_ref}");
 
     let refspecs = vec![artifact_spec, mirror_spec];
-    push_refs(repo_path, remote_url, &refspecs)
+    push_refs(repo_path, remote_url, &refspecs, auth_header)
 }
 
 #[cfg(test)]
@@ -191,7 +208,7 @@ mod tests {
     fn push_refs_empty_is_noop() {
         let dir = temp_dir("empty");
         let _repo = gix::init_bare(&dir).expect("init bare");
-        let result = push_refs(&dir, "does-not-exist", &[]).expect("noop");
+        let result = push_refs(&dir, "does-not-exist", &[], None).expect("noop");
         assert!(result.pushed.is_empty());
     }
 
@@ -231,6 +248,7 @@ mod tests {
             "refs/heads/main",
             "refs/heads/upstream/main",
             "main",
+            None,
         )
         .expect("push_fork_refs");
 
@@ -262,6 +280,7 @@ mod tests {
             &dir,
             "file:///nonexistent/path.git",
             &["refs/heads/main:refs/heads/main".to_string()],
+            None,
         );
         assert!(result.is_err(), "should fail for invalid remote");
     }
@@ -284,6 +303,7 @@ mod tests {
             &mirror_dir,
             &fork_dir.display().to_string(),
             &["refs/heads/main:refs/heads/main".to_string()],
+            None,
         )
         .expect("push single ref");
 

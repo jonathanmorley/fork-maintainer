@@ -224,12 +224,18 @@ where
 
 /// Build the axum router for the webhook server.
 ///
-/// `POST /api/webhook` is the GitHub-configured endpoint.
+/// - `GET /healthz` — liveness probe (always 200 OK).
+/// - `POST /api/webhook` — GitHub-configured webhook endpoint.
 pub fn router<F>(state: AppState<F>) -> axum::Router
 where
     F: Fn(String) + Send + Sync + Clone + 'static,
 {
+    async fn healthz() -> &'static str {
+        "ok"
+    }
+
     axum::Router::new()
+        .route("/healthz", axum::routing::get(healthz))
         .route("/api/webhook", axum::routing::post(handler::<F>))
         .with_state(state)
 }
@@ -417,5 +423,50 @@ mod tests {
         let status = run_handler(state, Some("issues"), None, BODY);
         assert_eq!(status, axum::http::StatusCode::OK);
         assert!(!*called.lock().unwrap());
+    }
+
+    #[test]
+    fn healthz_returns_200() {
+        // Drive a real listener on an ephemeral port and hit GET /healthz with
+        // a raw HTTP request (no extra client dependency needed).
+        let called: std::sync::Arc<std::sync::Mutex<bool>> =
+            std::sync::Arc::new(std::sync::Mutex::new(false));
+        let state = AppState {
+            secret: SECRET.into(),
+            handle: {
+                let called = called.clone();
+                move |_: String| *called.lock().unwrap() = true
+            },
+        };
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let status = rt.block_on(async {
+            let local = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = local.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                axum::serve(local, router(state)).await.unwrap();
+            });
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            stream
+                .write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            let mut buf = Vec::new();
+            stream.read_to_end(&mut buf).await.unwrap();
+            server.abort();
+            let status_line = String::from_utf8_lossy(&buf)
+                .lines()
+                .next()
+                .unwrap_or("")
+                .to_string();
+            assert!(
+                status_line.contains("200 OK"),
+                "unexpected response: {status_line}"
+            );
+            // Return value is not needed; the assert already validated status.
+            axum::http::StatusCode::OK
+        });
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let _ = called;
     }
 }

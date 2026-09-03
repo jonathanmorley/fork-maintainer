@@ -169,7 +169,39 @@ ref.
 
 - [ ] Stack cascade-rebase (behind `Rebase` trait; gix rebase is "idea" stage)
 
-## Project layout
+## Deployment (Render)
+
+The app is containerized (see `Dockerfile`) and ships a Render blueprint
+(`render.yaml`). It needs three things to function:
+
+1. **A GitHub App** — create one, install it on the forks to maintain, and put
+   the app's `app_id`, `private_key_pem`, and `webhook_secret` into config.
+2. **Config** — a JSON `AppConfig` (see `src/config.rs`) exposed to the app via
+   the `FORK_MAINTAINER_CONFIG` env var. Each `ForkConfig` needs a `local_mirror`
+   path on the persistent disk (mount `/data/mirrors`, e.g.
+   `/data/mirrors/<fork>`).
+3. **Persistent disk** — Render web services reset their filesystem on deploy,
+   so the local mirrors must live on a mounted disk. The app clones each fork's
+   bare mirror on first boot (`mirror::ensure_mirror`) and reuses it thereafter;
+   no manual `git clone` setup needed.
+
+### Health check
+
+`GET /healthz` returns `200 OK` and is wired as Render's `healthCheckPath`.
+
+### First deploy
+
+1. `render.yaml` declares a `starter` web service with a 10 GB disk mounted at
+   `/data/mirrors`, `FORK_MAINTAINER_ADDR=0.0.0.0:10000` (Render's expected
+   port for web services), and a 300 s poll interval.
+2. Set `FORK_MAINTAINER_CONFIG` to a secret env var (a JSON string is fine;
+   the private key can be base64-decoded into the PEM on boot if needed).
+3. Point GitHub's webhook at `https://<service>.onrender.com/api/webhook` with
+   the app's webhook secret.
+4. On first reconcile the app clones the fork mirrors, syncs upstream, composes
+   the artifact, and pushes it back — the fork self-maintains from then on.
+
+### Project layout
 
 ```
 src/
@@ -178,6 +210,7 @@ src/
   webhook.rs       — GitHub webhook signature verification + event dispatch
   poll.rs          — upstream-drift poll loop (scheduling + outcome classify)
   reconcile.rs     — live reconcile orchestration (discovery + fetch + engine)
+  mirror.rs        — first-boot bare-mirror clone into local storage
   github/
     mod.rs         — module root + re-exports
     discovery.rs   — open-PR stack discovery (ordering logic) + live PR fetch

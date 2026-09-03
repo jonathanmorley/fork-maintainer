@@ -22,7 +22,7 @@ use anyhow::Result;
 use gix::{Repository, actor::SignatureRef};
 
 use crate::config::ForkConfig;
-use crate::engine::stack::{StackOutcome, compose};
+use crate::engine::rebase::{ComposeOutcome, Rebase};
 use crate::engine::sync::{SyncResult, sync_mirror};
 
 /// The outcome of a full reconcile pass.
@@ -31,7 +31,7 @@ pub struct ReconcileOutcome {
     /// How the upstream mirror was synced.
     pub sync: SyncResult,
     /// How the artifact was recomposed.
-    pub compose: StackOutcome,
+    pub compose: ComposeOutcome,
 }
 
 /// Reconcile a single fork toward its desired state.
@@ -48,12 +48,32 @@ pub struct ReconcileOutcome {
 /// `stack` is the ordered list of fork branch refs forming the artifact's
 /// layers — the fork-owned branch first, then the patch PRs. It is applied
 /// on top of the freshly mirrored upstream tip.
+///
+/// `strategy` controls how the stack is composed onto the base. The default
+/// is [`crate::engine::rebase::Overlay`]; pass [`crate::engine::rebase::Merge`]
+/// for 3-way merge with conflict detection.
 pub fn reconcile(
     repo: &Repository,
     cfg: &ForkConfig,
     upstream_url: &str,
     stack: &[String],
     committer: SignatureRef<'_>,
+) -> Result<ReconcileOutcome> {
+    let strategy = crate::engine::rebase::Overlay;
+    reconcile_with_strategy(repo, cfg, upstream_url, stack, committer, &strategy)
+}
+
+/// Reconcile a single fork with a specific composition strategy.
+///
+/// This is the flexible version of [`reconcile`] that accepts any
+/// [`Rebase`] implementation.
+pub fn reconcile_with_strategy(
+    repo: &Repository,
+    cfg: &ForkConfig,
+    upstream_url: &str,
+    stack: &[String],
+    committer: SignatureRef<'_>,
+    strategy: &dyn Rebase,
 ) -> Result<ReconcileOutcome> {
     let branch = cfg.upstream_branch();
     let artifact = cfg.default_branch.clone();
@@ -65,7 +85,7 @@ pub fn reconcile(
     let sync = sync_mirror(repo, upstream_url, &branch, &mirror_ref, &track_ref)?;
 
     // 2. Compose the artifact on top of the freshly synced mirror tip.
-    let compose = compose(repo, &mirror_ref, stack, &artifact_ref, committer)?;
+    let compose = strategy.compose(repo, &mirror_ref, stack, &artifact_ref, committer)?;
 
     Ok(ReconcileOutcome { sync, compose })
 }

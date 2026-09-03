@@ -100,7 +100,7 @@ pub fn classify(result: Result<ReconcileOutcome>) -> PollOutcome {
 mod tests {
     use super::*;
     use crate::engine::pipeline::ReconcileOutcome;
-    use crate::engine::stack::StackOutcome;
+    use crate::engine::rebase::ComposeOutcome;
     use crate::engine::sync::SyncResult;
     use gix::ObjectId;
     use gix::actor::SignatureRef;
@@ -112,7 +112,7 @@ mod tests {
                 tip: ObjectId::null(gix::hash::Kind::Sha1),
                 ff,
             },
-            compose: StackOutcome {
+            compose: ComposeOutcome {
                 tree: ObjectId::null(gix::hash::Kind::Sha1),
                 commit: ObjectId::null(gix::hash::Kind::Sha1),
                 patches_applied: 0,

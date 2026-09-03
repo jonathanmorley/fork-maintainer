@@ -21,6 +21,7 @@
 pub mod config;
 pub mod engine;
 pub mod github;
+pub mod mirror;
 pub mod poll;
 pub mod reconcile;
 pub mod webhook;

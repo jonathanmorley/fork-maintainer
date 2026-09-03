@@ -25,8 +25,22 @@ use fork_maintainer::webhook::AppState;
 use gix::actor::SignatureRef;
 
 /// The committer identity stamped on recompose commits.
-const COMMITTER: &[u8] =
-    b"fork-maintainer <fork-maintainer@users.noreply.github.com> 1711398853 +0000";
+///
+/// The name and email are fixed; the timestamp is set dynamically when the
+/// function is called.
+const COMMITTER_IDENTITY: &[u8] = b"fork-maintainer <fork-maintainer@users.noreply.github.com> ";
+
+/// Build a committer signature with the current time.
+fn current_committer() -> Result<SignatureRef<'static>> {
+    let now = chrono::Utc::now();
+    let timestamp = now.format("%s %z").to_string();
+    let mut buf = Vec::with_capacity(COMMITTER_IDENTITY.len() + timestamp.len());
+    buf.extend_from_slice(COMMITTER_IDENTITY);
+    buf.extend_from_slice(timestamp.as_bytes());
+    // Leak the buffer so the SignatureRef can borrow it for 'static.
+    let leaked: &'static [u8] = Box::leak(buf.into_boxed_slice());
+    SignatureRef::from_bytes(leaked).context("build committer signature")
+}
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt().with_target(false).init();
@@ -108,7 +122,13 @@ async fn reconcile_fork(app: Option<AppCredentials>, fork: ForkConfig) -> PollOu
         tracing::warn!(fork = %fork.fork, "fork has no local_mirror; skipping");
         return PollOutcome::Failed("fork has no local_mirror configured".into());
     }
-    let committer = SignatureRef::from_bytes(COMMITTER).expect("valid committer");
+    let committer = match current_committer() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(fork = %fork.fork, "failed to build committer: {e}");
+            return PollOutcome::Failed("failed to build committer".into());
+        }
+    };
     let result = fork_maintainer::reconcile::reconcile_and_push_live(&app, &fork, committer).await;
     match result {
         Ok((outcome, push)) => {
@@ -145,6 +165,7 @@ fn load_config() -> Result<AppConfig> {
             .with_context(|| format!("read config file {}", path.display()))?;
         let cfg: AppConfig = serde_json::from_str(&raw)
             .with_context(|| format!("parse config {}", path.display()))?;
+        validate_config(&cfg, path)?;
         tracing::info!(path = %path.display(), "loaded config");
         return Ok(cfg);
     }
@@ -155,6 +176,42 @@ fn load_config() -> Result<AppConfig> {
         private_key_pem: String::new(),
         forks: vec![],
     })
+}
+
+/// Validate a loaded app config and return useful errors early.
+///
+/// - Each configured fork must have a `local_mirror` path (without one the
+///   poll loop and webhook can only skip it).
+/// - Each fork must specify both `upstream` and `fork`.
+/// - The app config should have a non-zero `app_id` when credentials are
+///   expected.
+fn validate_config(cfg: &AppConfig, path: &std::path::Path) -> Result<()> {
+    for fork in &cfg.forks {
+        if fork.local_mirror.is_none() {
+            anyhow::bail!(
+                "{}: fork `{}` has no `local_mirror` configured; the poll loop and webhook will skip it",
+                path.display(),
+                fork.fork.slug()
+            );
+        }
+        if fork.upstream.owner.is_empty() || fork.upstream.name.is_empty() {
+            anyhow::bail!(
+                "{}: fork `{}` has an incomplete `upstream`",
+                path.display(),
+                fork.fork.slug()
+            );
+        }
+        if fork.fork.owner.is_empty() || fork.fork.name.is_empty() {
+            anyhow::bail!("{}: fork has an incomplete `fork` identity", path.display());
+        }
+    }
+    if !cfg.private_key_pem.is_empty() && cfg.app_id == 0 {
+        anyhow::bail!(
+            "{}: `app_id` must be non-zero when `private_key_pem` is set",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 /// Resolve the config file path: `FORK_MAINTAINER_CONFIG`, else `config.json`.
