@@ -37,6 +37,7 @@
 use anyhow::{Context, Result};
 use gix::Repository;
 use gix::actor::SignatureRef;
+use gix::diff::tree_with_rewrites::Change as TreeChange;
 
 /// The result of composing a branch stack onto a base.
 ///
@@ -149,26 +150,61 @@ impl Rebase for Merge {
                 other: Some(branch.as_bytes().into()),
             };
 
-            let options = repo.tree_merge_options()?;
+            let options = repo
+                .tree_merge_options()?
+                // No rename/copy tracking: layers are independently authored
+                // patch branches, so cross-file similarity is boilerplate
+                // coincidence, never intent. Rename pairing actively harms
+                // layering — observed live when two 90%-similar example files
+                // (one per patch) were paired into a spurious conflict. The
+                // overlay path likewise diffs with rewrites disabled.
+                .with_rewrites(None);
             let mut outcome = repo
                 .merge_trees(ancestor_tree, running_tree, branch_tree, labels, options)
                 .with_context(|| format!("3-way merge for branch `{branch}`"))?;
 
-            // Check for unresolved conflicts.
-            if !outcome.conflicts.is_empty() {
-                let mut paths: Vec<String> = outcome
-                    .conflicts
-                    .iter()
-                    .map(|c| c.ours.location().to_string())
-                    .collect();
-                paths.sort();
-                paths.dedup();
+            // Judge conflicts the way git would. gix-merge lists even
+            // auto-resolved entries in `conflicts`, so an emptiness check
+            // would cry wolf — use `is_unresolved` with git-compatible
+            // strictness instead. Identical additions on both sides (same
+            // path, mode, and blob — routine when an upper patch contains a
+            // lower patch's files verbatim) are agreed content: take them.
+            // gix-merge conservatively reports those as Err(Unknown) while
+            // git merges them cleanly.
+            let mut actionable: Vec<String> = Vec::new();
+            for conflict in &outcome.conflicts {
+                if let (
+                    TreeChange::Addition {
+                        location: ours_loc,
+                        id: ours_id,
+                        entry_mode: ours_mode,
+                        ..
+                    },
+                    TreeChange::Addition {
+                        location: theirs_loc,
+                        id: theirs_id,
+                        entry_mode: theirs_mode,
+                        ..
+                    },
+                ) = (&conflict.ours, &conflict.theirs)
+                    && ours_loc == theirs_loc
+                    && ours_id == theirs_id
+                    && ours_mode == theirs_mode
+                {
+                    outcome.tree.upsert(ours_loc, ours_mode.kind(), *ours_id)?;
+                } else if conflict.is_unresolved(gix::merge::tree::TreatAsUnresolved::git()) {
+                    actionable.push(conflict.ours.location().to_string());
+                }
+            }
+            if !actionable.is_empty() {
+                actionable.sort();
+                actionable.dedup();
                 anyhow::bail!(
                     "conflicts detected while merging patch `{branch}` at {} path(s): {}. \
                      Resolve on the patch branch (never on the synthesized output) and re-run; \
                      nothing was pushed",
-                    paths.len(),
-                    paths.join(", ")
+                    actionable.len(),
+                    actionable.join(", ")
                 );
             }
 
@@ -497,5 +533,63 @@ mod tests {
 
         assert_eq!(outcome.patches_applied, 2);
         assert_eq!(ref_id(&repo, "refs/heads/main"), Some(outcome.commit));
+    }
+
+    /// An auto-resolved content merge must not fail the run.
+    ///
+    /// Blobs extracted from a live failure (provider.go across three stacked
+    /// states: ancestor, layer result, stacked tip). gix lists the
+    /// successfully merged content in `conflicts`; judging by emptiness
+    /// fails this clean merge, while `is_unresolved(git())` passes it —
+    /// matching git, which merges the same inputs without conflict.
+    #[test]
+    fn auto_resolved_blob_merge_does_not_fail() {
+        let dir = temp_dir("auto_resolved");
+        let repo = gix::init_bare(&dir).expect("init bare");
+
+        let commit_provider = |content: &str, parent: Option<gix::ObjectId>| {
+            let blob = repo.write_blob(content).expect("write blob");
+            let mut editor = repo.edit_tree(repo.empty_tree().id).expect("edit tree");
+            editor
+                .upsert("provider.go", EntryKind::Blob, blob.detach())
+                .expect("upsert");
+            let tree_id = editor.write().expect("write tree").detach();
+            repo.new_commit_as(sig(), sig(), "m", tree_id, parent)
+                .expect("new commit")
+                .id
+        };
+
+        let v0 = include_str!("fixtures/provider_v0.go");
+        let v1 = include_str!("fixtures/provider_v1.go");
+        let v2 = include_str!("fixtures/provider_v2.go");
+
+        let base = commit_provider(v0, None);
+        repo.reference("refs/heads/upstream/main", base, PreviousValue::Any, "init")
+            .expect("set base");
+        let l1 = commit_provider(v1, Some(base));
+        repo.reference("refs/heads/l1", l1, PreviousValue::Any, "init l1")
+            .expect("set l1");
+        let l2 = commit_provider(v2, Some(l1));
+        repo.reference("refs/heads/l2", l2, PreviousValue::Any, "init l2")
+            .expect("set l2");
+
+        let outcome = Merge
+            .compose(
+                &repo,
+                "refs/heads/upstream/main",
+                &["refs/heads/l1".to_string(), "refs/heads/l2".to_string()],
+                "refs/heads/main",
+                sig(),
+            )
+            .expect("auto-resolved merge must succeed");
+
+        // The merged tree carries the stacked tip's content.
+        let mut tree = repo.find_tree(outcome.tree).expect("find tree");
+        let entry = tree
+            .peel_to_entry(["provider.go"])
+            .expect("peel")
+            .expect("provider.go present");
+        let blob = repo.find_blob(entry.oid().to_owned()).expect("find blob");
+        assert_eq!(String::from_utf8_lossy(&blob.data).as_ref(), v2);
     }
 }
