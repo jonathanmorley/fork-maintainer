@@ -50,14 +50,18 @@ pub struct SynthesizeOutcome {
 
 /// Resolve a [`Strategy`] to its [`Rebase`] implementation.
 ///
+/// [`Strategy::Replay`] has no single-commit implementation — the pipeline
+/// dispatches it to [`crate::engine::replay::replay`] before calling here —
+/// so requesting it is an internal error.
+///
 /// # Errors
 ///
-/// This cannot fail today (both strategies are implemented); the `Result`
-/// keeps the seam open for future strategies.
+/// Returns an error for [`Strategy::Replay`].
 fn strategy_impl(strategy: Strategy) -> Result<Box<dyn Rebase>> {
     match strategy {
         Strategy::Overlay => Ok(Box::new(Overlay)),
         Strategy::Merge => Ok(Box::new(Merge)),
+        Strategy::Replay => anyhow::bail!("internal error: replay is not a Rebase strategy"),
     }
 }
 
@@ -159,20 +163,42 @@ pub fn synthesize_with_urls(
         patch_refs.push(local);
     }
 
-    // 2. Compose the output tree from base + patches in order.
-    let strategy_impl = strategy_impl(strategy)?;
-    let ComposeOutcome {
-        tree,
-        commit,
-        patches_applied,
-    } = strategy_impl
-        .compose(repo, BASE_REF, &patch_refs, OUTPUT_REF, committer)
-        .with_context(|| {
-            format!(
-                "compose {} patch(es) onto {base_branch} from {base_url}",
-                patches.len()
-            )
-        })?;
+    // 2. Compose the output from base + patches in order. Replay preserves
+    // each unique commit; overlay/merge squash each layer into one commit.
+    let (tree, commit, patches_applied) = match strategy {
+        Strategy::Replay => {
+            let out =
+                crate::engine::replay::replay(repo, BASE_REF, &patch_refs, OUTPUT_REF, committer)
+                    .with_context(|| {
+                    format!(
+                        "replay {} patch(es) onto {base_branch} from {base_url}",
+                        patches.len()
+                    )
+                })?;
+            tracing::info!(
+                replayed = out.commits_replayed,
+                skipped = out.skipped,
+                "replayed patch commits"
+            );
+            (out.tree, out.head, patch_refs.len())
+        }
+        _ => {
+            let strategy_impl = strategy_impl(strategy)?;
+            let ComposeOutcome {
+                tree,
+                commit,
+                patches_applied,
+            } = strategy_impl
+                .compose(repo, BASE_REF, &patch_refs, OUTPUT_REF, committer)
+                .with_context(|| {
+                    format!(
+                        "compose {} patch(es) onto {base_branch} from {base_url}",
+                        patches.len()
+                    )
+                })?;
+            (tree, commit, patches_applied)
+        }
+    };
 
     // 3. Skip the push when the published tip already carries this tree.
     if let Some(_prev) = fetch_prev_output(repo, output_url, output_branch)?
@@ -586,6 +612,82 @@ mod tests {
         assert_eq!(
             tree_blob(&scratch, out.tree, "b/example.txt").as_deref(),
             Some(boiler_b.as_str())
+        );
+    }
+
+    /// Replay strategy pushes a linear history preserving patch commits.
+    #[test]
+    fn replay_pushes_linear_history() {
+        let upstream_dir = temp_dir("rup");
+        let upstream = gix::init_bare(&upstream_dir).expect("init upstream");
+        let base = commit_with_files(&upstream, &[("a.txt", "a1")], "base", None);
+        set_ref(&upstream, "refs/heads/main", base);
+
+        // Patch repo with a two-commit branch sharing the base's history
+        // (replicated root unifies SHAs, as fetched real branches do).
+        let patch_dir = temp_dir("rpatch");
+        let patch_repo = gix::init_bare(&patch_dir).expect("init patch repo");
+        let c0 = commit_with_files(&patch_repo, &[("a.txt", "a1")], "base", None);
+        assert_eq!(c0, base, "replicated root must unify with upstream base");
+        let c1 = commit_with_files(
+            &patch_repo,
+            &[("a.txt", "a1"), ("f.txt", "f")],
+            "add feature",
+            Some(c0),
+        );
+        let c2 = commit_with_files(
+            &patch_repo,
+            &[("a.txt", "a2"), ("f.txt", "f")],
+            "tweak a",
+            Some(c1),
+        );
+        set_ref(&patch_repo, "refs/heads/feature", c2);
+
+        let output_dir = temp_dir("rout");
+        let _output = gix::init_bare(&output_dir).expect("init output");
+
+        let run = |tag: &str| {
+            let scratch_dir = temp_dir(&format!("rscratch-{tag}"));
+            let scratch = gix::init_bare(&scratch_dir).expect("init scratch");
+            synthesize_with_urls(
+                &scratch,
+                &url(&upstream_dir),
+                "main",
+                &[(url(&patch_dir), "feature".to_string())],
+                &url(&output_dir),
+                "main",
+                Strategy::Replay,
+                sig(),
+            )
+            .expect("synthesize")
+        };
+
+        let first = run("a");
+        assert!(first.pushed);
+
+        // Output history is base -> replay(c1) -> replay(c2) with messages.
+        let output = gix::open(&output_dir).expect("open output");
+        let tip = ref_id(&output, "refs/heads/main").expect("tip");
+        let head = output.find_commit(tip).expect("head");
+        let parent = head.parent_ids().next().expect("parent").detach();
+        let head_msg = head.message_raw().expect("msg").to_string();
+        assert!(head_msg.contains("tweak a"), "got: {head_msg}");
+        assert!(head_msg.contains("Synthesized-from"), "got: {head_msg}");
+        let parent_msg = output
+            .find_commit(parent)
+            .expect("parent commit")
+            .message_raw()
+            .expect("msg")
+            .to_string();
+        assert!(parent_msg.contains("add feature"), "got: {parent_msg}");
+
+        // Second identical run is a quiet no-op.
+        let second = run("b");
+        assert!(!second.pushed, "second run skips push");
+        assert_eq!(
+            ref_id(&output, "refs/heads/main"),
+            Some(tip),
+            "output ref untouched"
         );
     }
 }

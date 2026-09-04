@@ -163,50 +163,10 @@ impl Rebase for Merge {
                 .merge_trees(ancestor_tree, running_tree, branch_tree, labels, options)
                 .with_context(|| format!("3-way merge for branch `{branch}`"))?;
 
-            // Judge conflicts the way git would. gix-merge lists even
-            // auto-resolved entries in `conflicts`, so an emptiness check
-            // would cry wolf — use `is_unresolved` with git-compatible
-            // strictness instead. Identical additions on both sides (same
-            // path, mode, and blob — routine when an upper patch contains a
-            // lower patch's files verbatim) are agreed content: take them.
-            // gix-merge conservatively reports those as Err(Unknown) while
-            // git merges them cleanly.
-            let mut actionable: Vec<String> = Vec::new();
-            for conflict in &outcome.conflicts {
-                if let (
-                    TreeChange::Addition {
-                        location: ours_loc,
-                        id: ours_id,
-                        entry_mode: ours_mode,
-                        ..
-                    },
-                    TreeChange::Addition {
-                        location: theirs_loc,
-                        id: theirs_id,
-                        entry_mode: theirs_mode,
-                        ..
-                    },
-                ) = (&conflict.ours, &conflict.theirs)
-                    && ours_loc == theirs_loc
-                    && ours_id == theirs_id
-                    && ours_mode == theirs_mode
-                {
-                    outcome.tree.upsert(ours_loc, ours_mode.kind(), *ours_id)?;
-                } else if conflict.is_unresolved(gix::merge::tree::TreatAsUnresolved::git()) {
-                    actionable.push(conflict.ours.location().to_string());
-                }
-            }
-            if !actionable.is_empty() {
-                actionable.sort();
-                actionable.dedup();
-                anyhow::bail!(
-                    "conflicts detected while merging patch `{branch}` at {} path(s): {}. \
-                     Resolve on the patch branch (never on the synthesized output) and re-run; \
-                     nothing was pushed",
-                    actionable.len(),
-                    actionable.join(", ")
-                );
-            }
+            // Judge conflicts the way git would (shared helper: identical
+            // additions are agreed content, the rest must be unresolvable
+            // to fail the run).
+            settle_conflicts(&mut outcome, branch)?;
 
             // Write the merged tree and advance the running tree.
             let merged_tree_id = outcome.tree.write()?.detach();
@@ -251,6 +211,62 @@ impl Rebase for Merge {
             patches_applied: branches.len(),
         })
     }
+}
+
+/// Settle a merge outcome's conflicts the way git would.
+///
+/// gix-merge lists even auto-resolved entries in `conflicts`, so an
+/// emptiness check would cry wolf — judge by `is_unresolved` with
+/// git-compatible strictness instead. Identical additions on both sides
+/// (same path, mode, and blob — routine when an upper patch contains a
+/// lower patch's files verbatim) are agreed content: take them into the
+/// outcome tree. gix-merge conservatively reports those as `Err(Unknown)`
+/// while git merges them cleanly.
+///
+/// `layer` names the patch (and commit, for replays) for error messages.
+/// On unresolved conflicts this bails listing the paths; the caller must
+/// treat that as fatal before anything is pushed.
+pub(crate) fn settle_conflicts(
+    outcome: &mut gix::merge::tree::Outcome<'_>,
+    layer: &str,
+) -> Result<()> {
+    let mut actionable: Vec<String> = Vec::new();
+    for conflict in &outcome.conflicts {
+        if let (
+            TreeChange::Addition {
+                location: ours_loc,
+                id: ours_id,
+                entry_mode: ours_mode,
+                ..
+            },
+            TreeChange::Addition {
+                location: theirs_loc,
+                id: theirs_id,
+                entry_mode: theirs_mode,
+                ..
+            },
+        ) = (&conflict.ours, &conflict.theirs)
+            && ours_loc == theirs_loc
+            && ours_id == theirs_id
+            && ours_mode == theirs_mode
+        {
+            outcome.tree.upsert(ours_loc, ours_mode.kind(), *ours_id)?;
+        } else if conflict.is_unresolved(gix::merge::tree::TreatAsUnresolved::git()) {
+            actionable.push(conflict.ours.location().to_string());
+        }
+    }
+    if !actionable.is_empty() {
+        actionable.sort();
+        actionable.dedup();
+        anyhow::bail!(
+            "conflicts detected while merging patch `{layer}` at {} path(s): {}. \
+             Resolve on the patch branch (never on the synthesized output) and re-run; \
+             nothing was pushed",
+            actionable.len(),
+            actionable.join(", ")
+        );
+    }
+    Ok(())
 }
 
 /// Cascade-rebase strategy — placeholder for future gix rebase support.

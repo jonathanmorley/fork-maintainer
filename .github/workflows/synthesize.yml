@@ -16,8 +16,8 @@
 #              per line, applied top-to-bottom. Blank lines and lines starting
 #              with `#` are ignored.
 #   output     (required) destination in `owner/name@branch` form.
-#   strategy   (optional) `merge` (default) or `overlay`; passed straight through
-#              to `synthesize --strategy`.
+#   strategy   (optional) `merge` (default), `overlay`, or `replay`;
+#              passed straight through to `synthesize --strategy`.
 #   engine-ref (optional) git ref of THIS repo to check out and build the
 #              `synthesize` binary from. Default `"main"`. A reusable workflow
 #              cannot default to its own SHA in YAML, so: pin the caller's
@@ -58,7 +58,7 @@ on:
         required: true
         type: string
       strategy:
-        description: "Synthesize strategy: merge or overlay"
+        description: "Synthesize strategy: merge, overlay, or replay"
         default: "merge"
         required: false
         type: string
