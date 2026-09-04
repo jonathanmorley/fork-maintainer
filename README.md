@@ -57,6 +57,15 @@ Each run, in an ephemeral runner with no persistent state:
   silently drop overlapping changes. Availability over correctness — declare
   it consciously.
 
+## Lifecycle
+
+After a green synthesis, `--lifecycle delete-merged` tidies patch branches
+whose pull requests have merged (deleted via the API, one branch per merged
+PR). The base and output branches are never touched. Nothing semantic:
+superseded-but-unmerged PRs are left alone, and nothing is ever closed or
+archived. Add `--dry-run` to preview, or `lifecycle: delete-merged` (+
+`dry-run: true`) in the action inputs.
+
 ## Tokens and permissions
 
 - The calling job must grant `contents: write` (plus `id-token: write` when

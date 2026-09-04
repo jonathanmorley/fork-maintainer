@@ -53,6 +53,13 @@ struct Args {
     /// directory under the system temp dir.
     #[arg(long)]
     workdir: Option<PathBuf>,
+    /// Post-synthesis lifecycle: `off` (default) or `delete-merged` (delete
+    /// patch branches whose PRs merged, after a green synthesis).
+    #[arg(long, default_value = "off")]
+    lifecycle: String,
+    /// Preview lifecycle actions without executing them.
+    #[arg(long)]
+    dry_run: bool,
 }
 
 /// Committer identity stamped on synthesized commits; the timestamp is the
@@ -202,6 +209,51 @@ fn main() -> Result<()> {
     } else {
         println!("no change: {} already carries {}", cfg.output, out.tree);
     }
+
+    run_lifecycle(&args.lifecycle, args.dry_run, &cfg, token.as_deref())?;
+    Ok(())
+}
+
+/// Run the post-synthesis lifecycle when `--lifecycle` selects it.
+///
+/// Runs after any green synthesis (pushed or quiet no-op): merged branches
+/// linger either way. Requires a token for the GitHub API.
+fn run_lifecycle(
+    lifecycle: &str,
+    dry_run: bool,
+    cfg: &SynthesisConfig,
+    token: Option<&str>,
+) -> Result<()> {
+    if lifecycle == "off" {
+        return Ok(());
+    }
+    if lifecycle != "delete-merged" {
+        anyhow::bail!("unknown lifecycle `{lifecycle}` (valid: off, delete-merged)");
+    }
+    let token = token.context(
+        "lifecycle delete-merged needs a token for the GitHub API \
+         (--token, SYNTH_TOKEN, or GITHUB_TOKEN)",
+    )?;
+    let github = fork_maintainer::lifecycle::GitHub::new("fork-maintainer/synthesize")?
+        .with_token(token.to_string());
+    let patch_prs =
+        fork_maintainer::lifecycle::collect_patch_prs(&github, &cfg.patches, &cfg.output)?;
+    let actions = fork_maintainer::lifecycle::plan(&patch_prs, &cfg.base, &cfg.output);
+    if actions.is_empty() {
+        println!("lifecycle: nothing to tidy");
+        return Ok(());
+    }
+    fork_maintainer::lifecycle::apply(&github, &actions, dry_run)?;
+    println!(
+        "lifecycle: {} branch{} {}",
+        actions.len(),
+        if actions.len() == 1 { "" } else { "es" },
+        if dry_run {
+            "would be deleted (dry run)"
+        } else {
+            "deleted"
+        }
+    );
     Ok(())
 }
 
@@ -219,6 +271,8 @@ mod tests {
             strategy: None,
             token: None,
             workdir: None,
+            lifecycle: "off".to_string(),
+            dry_run: false,
         }
     }
 

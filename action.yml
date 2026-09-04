@@ -92,6 +92,15 @@ inputs:
     description: "Token with read access to base/patches and write access to output"
     required: false
     default: ""
+  lifecycle:
+    description: "Post-synthesis lifecycle: off (default) or delete-merged (delete patch branches whose PRs merged)"
+    required: false
+    default: "off"
+  dry-run:
+    description: "Preview lifecycle actions without executing them"
+    required: false
+    default: false
+    type: boolean
 
 outputs:
   pushed:
@@ -159,11 +168,19 @@ runs:
         SYNTH_TOKEN: ${{ inputs.token != '' && inputs.token || steps.sts.outputs.token }}
         GITHUB_TOKEN: ${{ github.token }}
       run: |
+        LIFECYCLE_ARGS=""
+        if [ "${{ inputs.lifecycle }}" != "off" ]; then
+          LIFECYCLE_ARGS="--lifecycle ${{ inputs.lifecycle }}"
+        fi
+        if [ "${{ inputs.dry-run }}" = "true" ]; then
+          LIFECYCLE_ARGS="$LIFECYCLE_ARGS --dry-run"
+        fi
         SYNTH_OUT=$(./engine/target/release/synthesize \
           --base "${{ inputs.base }}" \
           $PATCH_ARGS \
           --output "${{ inputs.output }}" \
-          --strategy "${{ inputs.strategy }}" 2>&1 | tee /dev/stderr)
+          --strategy "${{ inputs.strategy }}" \
+          $LIFECYCLE_ARGS 2>&1 | tee /dev/stderr)
         LAST_LINE=$(printf '%s\n' "$SYNTH_OUT" | grep -E '^(pushed |no change: )' | tail -n 1)
         case "$LAST_LINE" in
           pushed\ *)
