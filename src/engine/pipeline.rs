@@ -509,4 +509,83 @@ mod tests {
             Some("a2")
         );
     }
+
+    /// Stacked boilerplate files across patches merge cleanly.
+    ///
+    /// Characterization test (not a regression guard): two stacked patches
+    /// adding similar boilerplate must compose without conflict. The live
+    /// trigger for this failure class needed real-scale content — the proven
+    /// guard is `auto_resolved_blob_merge_does_not_fail` in rebase.rs, which
+    /// uses blobs extracted from the live run.
+    #[test]
+    fn merge_ignores_similar_files_across_patches() {
+        let boilerplate = |name: &str| {
+            (1..=10)
+                .map(|i| {
+                    if i == 5 {
+                        format!("resource {name} line\n")
+                    } else {
+                        format!("common boilerplate line {i}\n")
+                    }
+                })
+                .collect::<String>()
+        };
+
+        // One repo holding base and a two-patch stack, like real branches.
+        let remote_dir = temp_dir("sim_remote");
+        let remote = gix::init_bare(&remote_dir).expect("init remote");
+        let boiler_a = boilerplate("aaa");
+        let boiler_b = boilerplate("bbb");
+        let base = commit_with_files(&remote, &[("base.txt", "b")], "base", None);
+        set_ref(&remote, "refs/heads/main", base);
+        let a = commit_with_files(
+            &remote,
+            &[("base.txt", "b"), ("a/example.txt", &boiler_a)],
+            "patch a",
+            Some(base),
+        );
+        set_ref(&remote, "refs/heads/patch-a", a);
+        let b = commit_with_files(
+            &remote,
+            &[
+                ("base.txt", "b"),
+                ("a/example.txt", &boiler_a),
+                ("b/example.txt", &boiler_b),
+            ],
+            "patch b",
+            Some(a),
+        );
+        set_ref(&remote, "refs/heads/patch-b", b);
+
+        let output_dir = temp_dir("sim_out");
+        let _output = gix::init_bare(&output_dir).expect("init output");
+
+        let scratch_dir = temp_dir("sim_scratch");
+        let scratch = gix::init_bare(&scratch_dir).expect("init scratch");
+
+        let out = synthesize_with_urls(
+            &scratch,
+            &url(&remote_dir),
+            "main",
+            &[
+                (url(&remote_dir), "patch-a".to_string()),
+                (url(&remote_dir), "patch-b".to_string()),
+            ],
+            &url(&output_dir),
+            "main",
+            Strategy::Merge,
+            sig(),
+        )
+        .expect("similar files across patches must merge cleanly");
+
+        assert!(out.pushed);
+        assert_eq!(
+            tree_blob(&scratch, out.tree, "a/example.txt").as_deref(),
+            Some(boiler_a.as_str())
+        );
+        assert_eq!(
+            tree_blob(&scratch, out.tree, "b/example.txt").as_deref(),
+            Some(boiler_b.as_str())
+        );
+    }
 }
