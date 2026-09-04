@@ -1,268 +1,323 @@
-//! fork-maintainer binary entrypoint.
+//! synthesize CLI — build a declarative branch from base + ordered patches.
 //!
-//! Loads the app configuration and starts the GitHub webhook server. GitHub
-//! POSTs fork events (push, pull_request) to `/api/webhook`; the handler
-//! verifies the HMAC signature and dispatches a reconcile for the affected
-//! fork.
+//! ```bash
+//! synthesize --base integrations/repo@main \
+//!   --patch myorg/repo@fork-owned \
+//!   --patch other/repo@feature-x \
+//!   --output myorg/repo@main \
+//!   --strategy merge
+//! ```
 //!
-//! Alongside the webhook, a background poll loop periodically reconciles every
-//! configured fork so an idle fork still picks up *upstream* drift (the app
-//! cannot subscribe to upstream — webhooks only fire for the repos it is
-//! installed on).
+//! Alternatively `--config synthesis.json` with the same shape (CLI flags
+//! override the file when both are given). The token resolves as
+//! `--token`, then `SYNTH_TOKEN`, then `GITHUB_TOKEN`.
 //!
-//! Configuration comes from `FORK_MAINTAINER_CONFIG` (a JSON file) or
-//! `config.json` in the working directory, or defaults to an empty list of
-//! forks. See [`fork_maintainer::config::AppConfig`].
+//! Exit 0 on success — including the quiet no-op when the output already
+//! carries the composed tree. Any failure (fetch, conflict, push) exits
+//! non-zero with the error on stderr; on conflict nothing is pushed.
 
 use std::path::PathBuf;
-use std::time::Duration;
 
 use anyhow::{Context, Result};
-use fork_maintainer::config::{AppConfig, ForkConfig};
-use fork_maintainer::github::auth::AppCredentials;
-use fork_maintainer::poll::PollOutcome;
-use fork_maintainer::webhook::AppState;
+use clap::Parser;
+use fork_maintainer::config::{BranchRef, Strategy, SynthesisConfig};
+use fork_maintainer::engine::pipeline::synthesize_with_urls;
 use gix::actor::SignatureRef;
 
-/// The committer identity stamped on recompose commits.
-///
-/// The name and email are fixed; the timestamp is set dynamically when the
-/// function is called.
-const COMMITTER_IDENTITY: &[u8] = b"fork-maintainer <fork-maintainer@users.noreply.github.com> ";
+/// Build a declarative branch from a base plus ordered patches.
+#[derive(Debug, Parser)]
+#[command(name = "synthesize", version)]
+struct Args {
+    /// Path to a JSON synthesis config file (alternative to flags).
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// Base branch as `owner/name@branch`.
+    #[arg(long)]
+    base: Option<String>,
+    /// Patch branch as `owner/name@branch`. Repeatable, applied in order.
+    /// Replaces config-file patches when at least one is given.
+    #[arg(long = "patch")]
+    patches: Vec<String>,
+    /// Output branch as `owner/name@branch`.
+    #[arg(long)]
+    output: Option<String>,
+    /// Composition strategy: `overlay` or `merge`. Overrides the config file
+    /// when given; defaults to the file's value, else `merge`.
+    #[arg(long)]
+    strategy: Option<String>,
+    /// Token for HTTPS git access. Falls back to `SYNTH_TOKEN`, then
+    /// `GITHUB_TOKEN`.
+    #[arg(long)]
+    token: Option<String>,
+    /// Scratch directory for the ephemeral bare repo. Defaults to a fresh
+    /// directory under the system temp dir.
+    #[arg(long)]
+    workdir: Option<PathBuf>,
+}
 
-/// Shared, reusable string buffer for building committer signatures. Reused
-/// across calls so we only ever leak a single allocation (the `SignatureRef`
-/// needs a `'static` borrow we cannot otherwise produce without an arena).
-static COMMITTER_BUFFER: std::sync::OnceLock<std::sync::Mutex<Vec<u8>>> =
-    std::sync::OnceLock::new();
+/// Committer identity stamped on synthesized commits; the timestamp is the
+/// current time, formatted without external date crates.
+const COMMITTER_PREFIX: &str = "fork-maintainer <fork-maintainer@users.noreply.github.com> ";
 
-/// Build a committer signature with the current time.
-fn current_committer() -> Result<SignatureRef<'static>> {
-    let buf = COMMITTER_BUFFER.get_or_init(|| {
-        let mut buf = Vec::with_capacity(128);
-        buf.extend_from_slice(COMMITTER_IDENTITY);
-        std::sync::Mutex::new(buf)
-    });
-    let mut buf = buf.lock().expect("committer mutex poisoned");
-    // Reset to just the identity, then append the fresh timestamp.
-    buf.truncate(COMMITTER_IDENTITY.len());
-    let timestamp = chrono::Utc::now().format("%s %z").to_string();
-    buf.extend_from_slice(timestamp.as_bytes());
-    // Take a snapshot that can live for 'static. The shared buffer is reused,
-    // so the per-call snapshot is the only allocation that is intentionally
-    // leaked (small and bounded by the number of in-flight reconciles).
-    let leaked: &'static [u8] = Box::leak(buf.clone().into_boxed_slice());
-    SignatureRef::from_bytes(leaked).context("build committer signature")
+fn committer() -> Result<SignatureRef<'static>> {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("system clock before epoch")?
+        .as_secs();
+    let rendered = format!("{COMMITTER_PREFIX}{secs} +0000");
+    // SignatureRef borrows; the process is ephemeral so one intentional leak
+    // per run is bounded and invisible.
+    let leaked: &'static str = Box::leak(rendered.into_boxed_str());
+    SignatureRef::from_bytes(leaked.as_bytes()).context("build committer signature")
+}
+
+/// Resolve the token: `--token`, then `SYNTH_TOKEN`, then `GITHUB_TOKEN`.
+fn resolve_token(flag: Option<String>) -> Option<String> {
+    flag.filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            std::env::var("SYNTH_TOKEN")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+        })
+        .or_else(|| {
+            std::env::var("GITHUB_TOKEN")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+        })
+}
+
+/// Embed a token into an HTTPS URL for git transport; non-HTTPS URLs
+/// (`file://`, local paths) pass through untouched.
+fn authed_url(url: &str, token: Option<&str>) -> String {
+    match token {
+        Some(t) if url.starts_with("https://") => {
+            url.replacen("https://", &format!("https://x-access-token:{t}@"), 1)
+        }
+        _ => url.to_string(),
+    }
+}
+
+fn load_config(args: &Args) -> Result<SynthesisConfig> {
+    let mut cfg = match &args.config {
+        Some(path) => {
+            let raw = std::fs::read_to_string(path)
+                .with_context(|| format!("read config file {}", path.display()))?;
+            serde_json::from_str(&raw)
+                .with_context(|| format!("parse config {}", path.display()))?
+        }
+        None => SynthesisConfig {
+            base: BranchRef::parse_compact(
+                args.base
+                    .as_deref()
+                    .context("--base is required without --config")?,
+            )?,
+            patches: vec![],
+            output: BranchRef::parse_compact(
+                args.output
+                    .as_deref()
+                    .context("--output is required without --config")?,
+            )?,
+            strategy: Strategy::Merge,
+        },
+    };
+    // Flags override the file when given. (`strategy` always parses: the flag
+    // default matches the config default, so an unset flag is a no-op.)
+    if let Some(base) = &args.base {
+        cfg.base = BranchRef::parse_compact(base)?;
+    }
+    if !args.patches.is_empty() {
+        cfg.patches = args
+            .patches
+            .iter()
+            .map(|p| BranchRef::parse_compact(p))
+            .collect::<Result<Vec<_>>>()?;
+    }
+    if let Some(output) = &args.output {
+        cfg.output = BranchRef::parse_compact(output)?;
+    }
+    if let Some(strategy) = &args.strategy {
+        cfg.strategy = Strategy::parse(strategy)?;
+    }
+    Ok(cfg)
+}
+
+fn scratch_dir(workdir: Option<PathBuf>) -> Result<PathBuf> {
+    let dir = match workdir {
+        Some(dir) => dir,
+        None => std::env::temp_dir().join(format!(
+            "synthesize-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .context("system clock")?
+                .as_nanos()
+        )),
+    };
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("create scratch dir {}", dir.display()))?;
+    Ok(dir)
 }
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt().with_target(false).init();
+    let args = Args::parse();
 
-    let cfg = load_config()?;
-    tracing::info!(forks = %cfg.forks.len(), "loaded configuration");
+    let cfg = load_config(&args)?;
+    let token = resolve_token(args.token);
+    tracing::info!(
+        base = %cfg.base,
+        patches = cfg.patches.len(),
+        output = %cfg.output,
+        strategy = ?cfg.strategy,
+        "synthesizing"
+    );
 
-    let runtime = tokio::runtime::Runtime::new().context("create tokio runtime")?;
-    runtime.block_on(async move {
-        let app = cfg.credentials();
-        let state = AppState {
-            secret: cfg.webhook_secret.clone(),
-            handle: make_dispatcher(app.clone(), cfg.forks.clone()),
-        };
-        let router = fork_maintainer::webhook::router(state);
+    let dir = scratch_dir(args.workdir)?;
+    let repo =
+        gix::init_bare(&dir).with_context(|| format!("init bare repo at {}", dir.display()))?;
+    let with_auth = |url: &str| authed_url(url, token.as_deref());
 
-        // Background poll loop for upstream drift; runs the webhook server
-        // until it shuts down.
-        let poll_handle = spawn_poll_loop(cfg.clone());
+    let out = synthesize_with_urls(
+        &repo,
+        &with_auth(&cfg.base.repo.https_url()),
+        &cfg.base.branch,
+        &cfg.patches
+            .iter()
+            .map(|p| (with_auth(&p.repo.https_url()), p.branch.clone()))
+            .collect::<Vec<_>>(),
+        &with_auth(&cfg.output.repo.https_url()),
+        &cfg.output.branch,
+        cfg.strategy,
+        committer()?,
+    )?;
 
-        let addr =
-            std::env::var("FORK_MAINTAINER_ADDR").unwrap_or_else(|_| "0.0.0.0:3000".to_string());
-        let listener = tokio::net::TcpListener::bind(&addr)
-            .await
-            .with_context(|| format!("bind webhook listener on {addr}"))?;
-        tracing::info!(%addr, "webhook server listening on /api/webhook");
-        axum::serve(listener, router)
-            .await
-            .context("serve webhook")?;
-
-        poll_handle.abort();
-        Ok(())
-    })
-}
-
-/// Spawn the background poll loop.
-///
-/// Runs a reconcile pass for every configured fork at a fixed interval
-/// (default 300s, overridable via `FORK_MAINTAINER_POLL_INTERVAL` seconds).
-/// The loop runs until the returned handle is aborted.
-fn spawn_poll_loop(cfg: AppConfig) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let interval = std::env::var("FORK_MAINTAINER_POLL_INTERVAL")
-            .ok()
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .map(Duration::from_secs)
-            .unwrap_or(Duration::from_secs(300));
-        tracing::info!(seconds = interval.as_secs(), "poll loop started");
-
-        let mut ticker = tokio::time::interval(interval);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            ticker.tick().await;
-            poll_once(&cfg).await;
-        }
-    })
-}
-
-/// Run a single poll pass for all configured forks.
-async fn poll_once(cfg: &AppConfig) {
-    let app = cfg.credentials();
-    let forks = cfg.forks.clone();
-    for fork in &forks {
-        let outcome = reconcile_fork(app.clone(), fork.clone()).await;
-        log_outcome(fork, outcome);
-    }
-}
-
-/// Reconcile a single fork against live GitHub, returning its [`PollOutcome`].
-///
-/// Requires app credentials (to mint an installation client + token) and a
-/// configured `local_mirror`. Missing either yields [`PollOutcome::Failed`].
-async fn reconcile_fork(app: Option<AppCredentials>, fork: ForkConfig) -> PollOutcome {
-    let Some(app) = app else {
-        tracing::warn!(fork = %fork.fork, "no app credentials configured; cannot reconcile live");
-        return PollOutcome::Failed("no app credentials configured".into());
-    };
-    if fork.local_mirror.is_none() {
-        tracing::warn!(fork = %fork.fork, "fork has no local_mirror; skipping");
-        return PollOutcome::Failed("fork has no local_mirror configured".into());
-    }
-    let committer = match current_committer() {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!(fork = %fork.fork, "failed to build committer: {e}");
-            return PollOutcome::Failed("failed to build committer".into());
-        }
-    };
-    let result = fork_maintainer::reconcile::reconcile_and_push_live(&app, &fork, committer).await;
-    match result {
-        Ok((outcome, push)) => {
-            if let Some(push) = push {
-                tracing::info!(
-                    fork = %fork.fork,
-                    pushed = ?push.pushed,
-                    "pushed recomposed artifact to fork"
-                );
-            }
-            fork_maintainer::poll::classify(Ok(outcome))
-        }
-        Err(e) => fork_maintainer::poll::classify(Err(e)),
-    }
-}
-
-/// Log a fork's poll outcome at the appropriate level.
-fn log_outcome(fork: &ForkConfig, outcome: PollOutcome) {
-    match outcome {
-        PollOutcome::NoChange => tracing::debug!(fork = %fork.fork, "no upstream drift"),
-        PollOutcome::Changed { note } => {
-            tracing::info!(fork = %fork.fork, %note, "fork reconciled")
-        }
-        PollOutcome::Failed(err) => tracing::warn!(fork = %fork.fork, "reconcile failed: {err}"),
-    }
-}
-
-/// Load `AppConfig` from `FORK_MAINTAINER_CONFIG`, falling back to
-/// `config.json`, or an empty config if neither exists.
-fn load_config() -> Result<AppConfig> {
-    let path = config_path();
-    if let Some(path) = &path {
-        let raw = std::fs::read_to_string(path)
-            .with_context(|| format!("read config file {}", path.display()))?;
-        let cfg: AppConfig = serde_json::from_str(&raw)
-            .with_context(|| format!("parse config {}", path.display()))?;
-        validate_config(&cfg, path)?;
-        tracing::info!(path = %path.display(), "loaded config");
-        return Ok(cfg);
-    }
-    tracing::warn!("no config file found; starting with an empty fork list");
-    Ok(AppConfig {
-        app_id: 0,
-        webhook_secret: String::new(),
-        private_key_pem: String::new(),
-        forks: vec![],
-    })
-}
-
-/// Validate a loaded app config and return useful errors early.
-///
-/// - Each fork must specify both `upstream` and `fork` (a fork with an
-///   incomplete identity is a hard error).
-/// - A fork without `local_mirror` is logged as a warning, not a hard error —
-///   the poll loop and webhook already skip such forks, so refusing to start
-///   the whole app would be a regression.
-/// - The app config should have a non-zero `app_id` when a private key is set.
-fn validate_config(cfg: &AppConfig, path: &std::path::Path) -> Result<()> {
-    for fork in &cfg.forks {
-        if fork.local_mirror.is_none() {
-            tracing::warn!(
-                path = %path.display(),
-                fork = %fork.fork.slug(),
-                "fork has no `local_mirror`; the poll loop and webhook will skip it"
-            );
-        }
-        if fork.upstream.owner.is_empty() || fork.upstream.name.is_empty() {
-            anyhow::bail!(
-                "{}: fork `{}` has an incomplete `upstream`",
-                path.display(),
-                fork.fork.slug()
-            );
-        }
-        if fork.fork.owner.is_empty() || fork.fork.name.is_empty() {
-            anyhow::bail!("{}: fork has an incomplete `fork` identity", path.display());
-        }
-    }
-    if !cfg.private_key_pem.is_empty() && cfg.app_id == 0 {
-        anyhow::bail!(
-            "{}: `app_id` must be non-zero when `private_key_pem` is set",
-            path.display()
+    if out.pushed {
+        println!(
+            "pushed {} ({} patch{}) to {}",
+            out.commit,
+            out.patches_applied,
+            if out.patches_applied == 1 { "" } else { "es" },
+            cfg.output
         );
-    }
-    if cfg.app_id != 0 && cfg.private_key_pem.is_empty() {
-        tracing::warn!(
-            "{}: `app_id` is set but `private_key_pem` is empty; live reconcile will be unavailable",
-            path.display()
-        );
+    } else {
+        println!("no change: {} already carries {}", cfg.output, out.tree);
     }
     Ok(())
 }
 
-/// Resolve the config file path: `FORK_MAINTAINER_CONFIG`, else `config.json`.
-fn config_path() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("FORK_MAINTAINER_CONFIG") {
-        return Some(PathBuf::from(p));
-    }
-    let local = std::path::Path::new("config.json");
-    local.exists().then(|| local.to_path_buf())
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
 
-/// Build the reconcile dispatcher for the webhook.
-///
-/// On a valid event for a configured fork, spawns a background reconcile of
-/// that fork (live discovery + full engine). Fork events fire only for repos
-/// the app is installed on, so matching the payload's `owner/name` against the
-/// configured forks is the right gate.
-fn make_dispatcher(
-    app: Option<AppCredentials>,
-    forks: Vec<ForkConfig>,
-) -> impl Fn(String) + Send + Sync + Clone + 'static {
-    move |full_name: String| {
-        let Some(fork) = forks.iter().find(|f| f.fork.slug() == full_name).cloned() else {
-            tracing::warn!(fork = %full_name, "event for unconfigured fork; ignored");
-            return;
-        };
-        tracing::info!(fork = %full_name, "reconcile requested for fork");
-        let app = app.clone();
-        tokio::spawn(async move {
-            let outcome = crate::reconcile_fork(app, fork.clone()).await;
-            crate::log_outcome(&fork, outcome);
-        });
+    fn args() -> Args {
+        Args {
+            config: None,
+            base: None,
+            patches: vec![],
+            output: None,
+            strategy: None,
+            token: None,
+            workdir: None,
+        }
+    }
+
+    #[test]
+    fn authed_url_embeds_token_only_for_https() {
+        assert_eq!(
+            authed_url("https://github.com/o/r.git", Some("tok")),
+            "https://x-access-token:tok@github.com/o/r.git"
+        );
+        assert_eq!(
+            authed_url("https://github.com/o/r.git", None),
+            "https://github.com/o/r.git"
+        );
+        assert_eq!(
+            authed_url("file:///tmp/r.git", Some("tok")),
+            "file:///tmp/r.git"
+        );
+        assert_eq!(authed_url("/tmp/r.git", Some("tok")), "/tmp/r.git");
+    }
+
+    #[test]
+    fn resolve_token_prefers_flag_then_synth_then_github() {
+        // Save and restore: these names are process-global.
+        let saved = (
+            std::env::var("SYNTH_TOKEN").ok(),
+            std::env::var("GITHUB_TOKEN").ok(),
+        );
+        unsafe {
+            std::env::remove_var("SYNTH_TOKEN");
+            std::env::remove_var("GITHUB_TOKEN");
+        }
+        assert_eq!(resolve_token(None), None);
+        unsafe {
+            std::env::set_var("GITHUB_TOKEN", "g");
+        }
+        assert_eq!(resolve_token(None).as_deref(), Some("g"));
+        unsafe {
+            std::env::set_var("SYNTH_TOKEN", "s");
+        }
+        assert_eq!(resolve_token(None).as_deref(), Some("s"));
+        assert_eq!(resolve_token(Some("f".to_string())).as_deref(), Some("f"));
+        unsafe {
+            std::env::remove_var("SYNTH_TOKEN");
+            std::env::remove_var("GITHUB_TOKEN");
+            if let Some(v) = &saved.0 {
+                std::env::set_var("SYNTH_TOKEN", v);
+            }
+            if let Some(v) = &saved.1 {
+                std::env::set_var("GITHUB_TOKEN", v);
+            }
+        }
+    }
+
+    #[test]
+    fn load_config_requires_base_and_output_without_file() {
+        let err = load_config(&args()).expect_err("needs base+output");
+        assert!(err.to_string().contains("--base"), "got: {err}");
+    }
+
+    #[test]
+    fn load_config_flags_assemble_full_spec() {
+        let mut a = args();
+        a.base = Some("up/repo@main".to_string());
+        a.patches = vec![
+            "me/repo@fork-owned".to_string(),
+            "you/repo@feat".to_string(),
+        ];
+        a.output = Some("me/repo@main".to_string());
+        a.strategy = Some("overlay".to_string());
+        let cfg = load_config(&a).expect("flags");
+        assert_eq!(cfg.base.compact(), "up/repo@main");
+        assert_eq!(cfg.patches.len(), 2);
+        assert_eq!(cfg.output.compact(), "me/repo@main");
+        assert_eq!(cfg.strategy, Strategy::Overlay);
+    }
+
+    #[test]
+    fn load_config_file_with_flag_overrides() {
+        let dir = std::env::temp_dir().join(format!("synth-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("synthesis.json");
+        let mut f = std::fs::File::create(&path).expect("create");
+        write!(
+            f,
+            "{{\
+                \"base\": {{\"repo\": {{\"owner\": \"u\", \"name\": \"r\"}}, \"branch\": \"main\"}}, \
+                \"patches\": [{{\"repo\": {{\"owner\": \"f\", \"name\": \"r\"}}, \"branch\": \"old\"}}], \
+                \"output\": {{\"repo\": {{\"owner\": \"f\", \"name\": \"r\"}}, \"branch\": \"main\"}}, \
+                \"strategy\": \"overlay\" \
+            }}"
+        )
+        .expect("write");
+        let mut a = args();
+        a.config = Some(path);
+        a.patches = vec!["f/r@new".to_string()];
+        let cfg = load_config(&a).expect("file+flags");
+        // Flags replace patches; file's base/output/strategy survive.
+        assert_eq!(cfg.patches.len(), 1);
+        assert_eq!(cfg.patches[0].compact(), "f/r@new");
+        assert_eq!(cfg.strategy, Strategy::Overlay);
     }
 }
