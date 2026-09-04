@@ -114,7 +114,7 @@ jobs:
             UPDATE_ARGS="$UPDATE_ARGS --dry-run"
           fi
           # shellcheck disable=SC2086
-          ./engine/target/release/synthesize update $UPDATE_ARGS
+          ./engine/target/release/synthesize --update $UPDATE_ARGS
           if [ -n "$(git status --porcelain -- ${{ inputs.config }} ${{ inputs.lockfile }})" ]; then
             echo "changed=true" >> "$GITHUB_OUTPUT"
           else
