@@ -1,0 +1,176 @@
+# Synthesize — declarative base + ordered patches into one output branch.
+#
+# A composite action (not a reusable workflow): it runs as steps inside the
+# CALLER's job, so the caller owns triggers, runners, permissions,
+# concurrency, and timeouts. Secrets and expressions evaluate in the caller
+# context — nothing crosses a workflow boundary.
+#
+# Caller example (in the fork):
+#
+#   jobs:
+#     sync:
+#       runs-on: ubuntu-latest
+#       permissions: { contents: write }   # + id-token: write when using sts
+#       concurrency: { group: synthesize-main, cancel-in-progress: false }
+#       steps:
+#         - uses: jonathanmorley/fork-maintainer@v1
+#           with:
+#             base: integrations/terraform-provider-github@main
+#             patches: |
+#               myorg/terraform-provider-github@fork-owned
+#               myorg/terraform-provider-github@feature-a
+#             output: myorg/terraform-provider-github@main
+#             token: ${{ secrets.SYNTH_TOKEN }}   # or github.token (see notes)
+#
+#   on: { push: { branches: [main] }, schedule: [{ cron: "0 6 * * *" }], workflow_dispatch: }
+#
+# Inputs:
+#   base       (required) upstream base in `owner/name@branch` form.
+#   patches    (required) multiline string, one `owner/name@branch` — or bare
+#              `branch` meaning the *caller's* repo (`github.repository`) —
+#              per line, applied top-to-bottom. Blank lines and lines starting
+#              with `#` are ignored. Patches may live in ANY readable repo.
+#   output     (required) destination in `owner/name@branch` form.
+#   strategy   (optional) `merge` (default), `overlay`, or `replay`;
+#              passed straight through to `synthesize --strategy`.
+#   engine-ref (optional) ref of jonathanmorley/fork-maintainer to build the
+#              engine binary from. Default `main`.
+#   sts-scope / sts-identity (optional) mint a short-lived token in-job via
+#              octo-sts/action (trust policy at
+#              `.github/chainguard/{sts-identity}.sts.yaml` in the scope repo).
+#   token      (optional) token secret with read access to base/patches and
+#              write access to output. Pass `${{ secrets.X }}` or
+#              `${{ github.token }}`.
+#
+# Outputs:
+#   pushed     `true` when the output branch was advanced, `false` on a
+#              quiet no-op (output already carried the composed tree).
+#   commit     the synthesized (or existing) output commit SHA. Empty when
+#              the run failed before composing.
+#
+# Token notes (precedence: explicit token > sts mint > github.token):
+#   - Secrets arrive as plain inputs here (composite actions have no secrets
+#     block); values are masked in logs as usual.
+#   - App/OIDC-minted tokens trigger downstream workflows on push;
+#     `github.token` does NOT (by GitHub design).
+#   - Private repos: the effective token needs read access to the base and
+#     every patch repo, and write access to the output repo.
+#
+# Idempotency: `synthesize` exits 0 logging "no change" when the output is
+# already up to date, so this is safe on a schedule.
+
+name: Synthesize
+description: Compose a declarative base branch plus ordered patch branches into one synthesized output branch.
+
+inputs:
+  base:
+    description: "Upstream base in owner/name@branch form"
+    required: true
+  patches:
+    description: "Multiline owner/name@branch list (bare branch = caller repo), applied top-to-bottom"
+    required: true
+  output:
+    description: "Destination in owner/name@branch form"
+    required: true
+  strategy:
+    description: "Synthesize strategy: merge, overlay, or replay"
+    required: false
+    default: "merge"
+  engine-ref:
+    description: "Ref of jonathanmorley/fork-maintainer to build the engine binary from"
+    required: false
+    default: "main"
+  sts-scope:
+    description: "Octo STS scope (org or org/repo). Callers using it must grant id-token: write."
+    required: false
+    default: ""
+  sts-identity:
+    description: "Octo STS trust policy name (.github/chainguard/{sts-identity}.sts.yaml in the scope repo)."
+    required: false
+    default: ""
+  token:
+    description: "Token with read access to base/patches and write access to output"
+    required: false
+    default: ""
+
+outputs:
+  pushed:
+    description: "Whether the output branch was advanced (false on quiet no-op)"
+    value: ${{ steps.synthesize.outputs.pushed }}
+  commit:
+    description: "Synthesized (or existing) output commit SHA"
+    value: ${{ steps.synthesize.outputs.commit }}
+
+runs:
+  using: composite
+  steps:
+    - name: Check out engine
+      uses: actions/checkout@v4
+      with:
+        repository: jonathanmorley/fork-maintainer
+        ref: ${{ inputs.engine-ref }}
+        path: engine
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache Rust dependencies
+      uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: engine
+
+    - name: Build synthesize
+      shell: bash
+      run: cargo build --release
+      working-directory: engine
+
+    - name: Resolve patch flags
+      shell: bash
+      env:
+        PATCHES: ${{ inputs.patches }}
+        CALLER_REPO: ${{ github.repository }}
+      run: |
+        PATCH_ARGS=""
+        while IFS= read -r line || [ -n "$line" ]; do
+          line="$(printf '%s' "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+          case "$line" in
+            ""|"#"*) continue ;;
+          esac
+          case "$line" in
+            *"/"*) patch="$line" ;;
+            *) patch="$CALLER_REPO@$line" ;;
+          esac
+          PATCH_ARGS="$PATCH_ARGS --patch $patch"
+        done <<< "$PATCHES"
+        echo "PATCH_ARGS=$PATCH_ARGS" >> "$GITHUB_ENV"
+
+    - name: Mint token via Octo STS
+      id: sts
+      if: inputs.sts-scope != '' && inputs.sts-identity != ''
+      uses: octo-sts/action@f603d3be9d8dd9871a265776e625a27b00effe05  # v1.1.1
+      with:
+        scope: ${{ inputs.sts-scope }}
+        identity: ${{ inputs.sts-identity }}
+
+    - name: Run synthesize
+      id: synthesize
+      shell: bash
+      env:
+        SYNTH_TOKEN: ${{ inputs.token != '' && inputs.token || steps.sts.outputs.token }}
+        GITHUB_TOKEN: ${{ github.token }}
+      run: |
+        SYNTH_OUT=$(./engine/target/release/synthesize \
+          --base "${{ inputs.base }}" \
+          $PATCH_ARGS \
+          --output "${{ inputs.output }}" \
+          --strategy "${{ inputs.strategy }}" 2>&1 | tee /dev/stderr)
+        LAST_LINE=$(printf '%s\n' "$SYNTH_OUT" | grep -E '^(pushed |no change: )' | tail -n 1)
+        case "$LAST_LINE" in
+          pushed\ *)
+            echo "pushed=true" >> "$GITHUB_OUTPUT"
+            echo "commit=$(printf '%s\n' "$LAST_LINE" | awk '{print $2}')" >> "$GITHUB_OUTPUT"
+            ;;
+          *)
+            echo "pushed=false" >> "$GITHUB_OUTPUT"
+            ;;
+        esac
