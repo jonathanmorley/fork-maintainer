@@ -28,14 +28,18 @@
 # (`permissions: { contents: write }` on the calling job), otherwise the push
 # to `output` fails.
 #
-# Token notes:
-#   - The secret `token` is exported as `SYNTH_TOKEN`; the CLI itself resolves
-#     `--token` flag > `SYNTH_TOKEN` env > `GITHUB_TOKEN` env, so no flag is passed.
-#   - GITHUB_TOKEN limitation: pushes made with the default `github.token` do
-#     NOT trigger downstream workflows (by GitHub design). To trigger CI/deploy
-#     workflows on the synthesized output, pass a PAT or GitHub App token instead.
-#   - Private upstreams: the token needs read access to the base, every patch
-#     repo, and write access to the output repo.
+# Token notes (precedence: explicit secret > sts mint > github.token):
+#   - The `token` secret, when set, is exported as `SYNTH_TOKEN`.
+#   - `sts-scope` + `sts-identity` mint a short-lived token in-job via
+#     octo-sts/action (trust policy at
+#     `.github/chainguard/{sts-identity}.sts.yaml` in the scope repo);
+#     callers using it must grant `id-token: write`. No stored credentials.
+#   - Otherwise the CLI falls back to `GITHUB_TOKEN`, then anonymous access
+#     (public repos only).
+#   - App/OIDC-minted tokens trigger downstream workflows on push;
+#     `github.token` does NOT (by GitHub design).
+#   - Private repos: the effective token needs read access to the base and
+#     every patch repo, and write access to the output repo.
 #
 # Idempotency: `synthesize` exits 0 logging "no change" when the output is
 # already up to date, so this is safe on a schedule.
@@ -67,10 +71,20 @@ on:
         default: "main"
         required: false
         type: string
+      sts-scope:
+        description: "Octo STS scope (org or org/repo). When set together with sts-identity, a short-lived token is minted in-job via octo-sts/action — no credential secrets required. Callers using it must grant id-token: write."
+        required: false
+        type: string
+        default: ''
+      sts-identity:
+        description: "Octo STS trust policy name (.github/chainguard/{sts-identity}.sts.yaml in the scope repo)."
+        required: false
+        type: string
+        default: ''
     secrets:
       token:
-        description: "Token with read access to base/patches and write access to output"
-        required: true
+        description: "Token with read access to base/patches and write access to output. Takes precedence over sts minting; when neither is set the run falls back to github.token, then anonymous access (public repos only)."
+        required: false
 
 concurrency:
   group: synthesize-${{ inputs.output }}
@@ -118,13 +132,20 @@ jobs:
           done <<< "$PATCHES"
           echo "PATCH_ARGS=$PATCH_ARGS" >> "$GITHUB_ENV"
 
+      - name: Mint token via Octo STS
+        id: sts
+        if: inputs.sts-scope != '' && inputs.sts-identity != ''
+        uses: octo-sts/action@f603d3be9d8dd9871a265776e625a27b00effe05  # v1.1.1
+        with:
+          scope: ${{ inputs.sts-scope }}
+          identity: ${{ inputs.sts-identity }}
+
       - name: Run synthesize
         env:
-          # Prefer the caller-provided secret; fall back to this run's own
-          # token (the CLI resolves SYNTH_TOKEN, then GITHUB_TOKEN).
-          # Belt-and-suspenders: secret transport to reusable workflows has
-          # been observed to arrive empty while github.token is populated.
-          SYNTH_TOKEN: ${{ secrets.token }}
+          # Precedence: caller-provided secret, then the sts-minted token,
+          # then this run's own token (the CLI resolves SYNTH_TOKEN, then
+          # GITHUB_TOKEN). Anonymous access covers public repos with neither.
+          SYNTH_TOKEN: ${{ secrets.token != '' && secrets.token || steps.sts.outputs.token }}
           GITHUB_TOKEN: ${{ github.token }}
         run: >
           ./engine/target/release/synthesize
