@@ -25,6 +25,10 @@
 #   on: { push: { branches: [main] }, schedule: [{ cron: "0 6 * * *" }], workflow_dispatch: }
 #
 # Inputs:
+#   config     (optional) caller config file path (the managed pattern:
+#              base/patches/output/strategy in one versioned file, plus a
+#              committed synthesis.lock). When set, base/patches/output
+#              inputs are ignored.
 #   base       (required) upstream base in `owner/name@branch` form.
 #   patches    (required) multiline string, one `owner/name@branch` — or bare
 #              `branch` meaning the *caller's* repo (`github.repository`) —
@@ -63,15 +67,22 @@ name: Synthesize
 description: Compose a declarative base branch plus ordered patch branches into one synthesized output branch.
 
 inputs:
+  config:
+    description: "Caller config file path (the managed pattern). When set, base/patches/output come from the file and their inputs are ignored."
+    required: false
+    default: ""
   base:
-    description: "Upstream base in owner/name@branch form"
-    required: true
+    description: "Upstream base in owner/name@branch form (not needed with config)"
+    required: false
+    default: ""
   patches:
-    description: "Multiline owner/name@branch list (bare branch = caller repo), applied top-to-bottom"
-    required: true
+    description: "Multiline owner/name@branch list (bare branch = caller repo), applied top-to-bottom (not needed with config)"
+    required: false
+    default: ""
   output:
-    description: "Destination in owner/name@branch form"
-    required: true
+    description: "Destination in owner/name@branch form (not needed with config)"
+    required: false
+    default: ""
   strategy:
     description: "Synthesize strategy: merge, overlay, or replay"
     required: false
@@ -168,14 +179,18 @@ runs:
         SYNTH_TOKEN: ${{ inputs.token != '' && inputs.token || steps.sts.outputs.token }}
         GITHUB_TOKEN: ${{ github.token }}
       run: |
+        if [ -n "${{ inputs.config }}" ]; then
+          SOURCE_ARGS="--config ${{ inputs.config }}"
+        else
+          SOURCE_ARGS="--base \"${{ inputs.base }}\" $PATCH_ARGS --output \"${{ inputs.output }}\""
+        fi
         LOCK_ARGS="--lockfile ${{ inputs.lockfile }}"
         if [ "${{ inputs.update-lock }}" = "true" ]; then
           LOCK_ARGS="$LOCK_ARGS --update-lock"
         fi
+        # shellcheck disable=SC2086
         SYNTH_OUT=$(./engine/target/release/synthesize \
-          --base "${{ inputs.base }}" \
-          $PATCH_ARGS \
-          --output "${{ inputs.output }}" \
+          $SOURCE_ARGS \
           --strategy "${{ inputs.strategy }}" \
           $LOCK_ARGS 2>&1 | tee /dev/stderr)
         LAST_LINE=$(printf '%s\n' "$SYNTH_OUT" | grep -E '^(pushed |no change: )' | tail -n 1)
