@@ -1,0 +1,146 @@
+# Update synthesis inputs — propose caller-file changes as a PR.
+#
+# A companion to the synthesize action for managed setups (caller uses
+# `--config synthesis.json` + committed `synthesis.lock`). It resolves
+# current patch tips and PR states, rewrites the config (dropping merged
+# patches) and lockfile, and opens a pull request — never pushing output,
+# deleting branches, or closing PRs. A human merges the proposal; the next
+# synthesis reflects it.
+#
+# Caller example (in the fork, alongside the synthesize caller):
+#
+#   jobs:
+#     update:
+#       uses: jonathanmorley/fork-maintainer/.github/workflows/update.yml@<sha>
+#       with:
+#         config: synthesis.json
+#       secrets:
+#         token: ${{ secrets.SYNTH_TOKEN }}
+#
+#   on:
+#     schedule: [{ cron: "0 7 * * 1" }]   # weekly reviewable refresh
+#     workflow_dispatch: {}               # manual, with optional dry-run
+#
+# Inputs:
+#   config     (optional) caller config path. Default `synthesis.json`.
+#   lockfile   (optional) lockfile path. Default `synthesis.lock`.
+#   engine-ref (optional) ref of jonathanmorley/fork-maintainer to build
+#              the updater binary from. Default `main`.
+#   dry-run    (optional) preview file changes without opening a PR.
+#              Default `false`.
+#   base-branch (optional) branch the update PR targets. Default `main`.
+#   token      (optional) secret with read access for PR state (and write
+#              for pushing the update branch when it differs from the
+#              checkout token). Falls back to `github.token`.
+#
+# Required caller permissions: `contents: write` (push update branch),
+# `pull-requests: write` (open the PR). No `id-token` needed.
+
+name: Update synthesis inputs
+
+on:
+  workflow_call:
+    inputs:
+      config:
+        description: "Caller config path"
+        required: false
+        type: string
+        default: "synthesis.json"
+      lockfile:
+        description: "Lockfile path"
+        required: false
+        type: string
+        default: "synthesis.lock"
+      engine-ref:
+        description: "Ref of jonathanmorley/fork-maintainer to build the updater binary from"
+        required: false
+        type: string
+        default: "main"
+      dry-run:
+        description: "Preview file changes without opening a PR"
+        required: false
+        type: boolean
+        default: false
+      base-branch:
+        description: "Branch the update PR targets"
+        required: false
+        type: string
+        default: "main"
+    secrets:
+      token:
+        description: "Token with read access for PR state"
+        required: false
+
+concurrency:
+  group: synthesize-update-${{ inputs.config }}
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out caller
+        uses: actions/checkout@v4
+
+      - name: Check out engine
+        uses: actions/checkout@v4
+        with:
+          repository: jonathanmorley/fork-maintainer
+          ref: ${{ inputs.engine-ref }}
+          path: engine
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+
+      - name: Build synthesize
+        shell: bash
+        run: cargo build --release
+        working-directory: engine
+
+      - name: Propose input updates
+        id: propose
+        shell: bash
+        env:
+          SYNTH_TOKEN: ${{ secrets.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          UPDATE_ARGS="--config ${{ inputs.config }} --lockfile ${{ inputs.lockfile }}"
+          if [ "${{ inputs.dry-run }}" = "true" ]; then
+            UPDATE_ARGS="$UPDATE_ARGS --dry-run"
+          fi
+          # shellcheck disable=SC2086
+          ./engine/target/release/synthesize update $UPDATE_ARGS
+          if [ -n "$(git status --porcelain -- ${{ inputs.config }} ${{ inputs.lockfile }})" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Open update PR
+        if: steps.propose.outputs.changed == 'true' && inputs.dry-run != true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          BRANCH="synthesize/update"
+          git config user.name "synthesize-update[bot]"
+          git config user.email "synthesize-update[bot]@users.noreply.github.com"
+          git checkout -B "$BRANCH"
+          git add -- "${{ inputs.config }}" "${{ inputs.lockfile }}"
+          git commit -m "chore: update synthesis inputs
+
+          Refresh patch pins and drop merged patches. Review the lock diff
+          and removed entries before merging." --quiet
+          git push --force-with-lease origin "$BRANCH"
+          if gh pr view "$BRANCH" --json number --jq .number >/dev/null 2>&1; then
+            echo "update PR already open; pushed new revision"
+          else
+            gh pr create --base "${{ inputs.base-branch }}" --head "$BRANCH" \
+              --title "chore: update synthesis inputs" \
+              --body "Automated maintenance proposal: refreshed patch pins and removed merged patches. Review the diff, then merge. The next synthesis run picks it up."
+          fi
