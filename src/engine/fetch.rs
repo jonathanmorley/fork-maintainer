@@ -219,4 +219,26 @@ mod tests {
         // And the tracking ref must not have been created.
         assert_eq!(ref_id(&fork, "refs/remotes/upstream/nope"), None);
     }
+
+    /// The HTTPS transport must be functional: fetching from an unroutable
+    /// host must fail at DNS/connection time, never with "unsupported
+    /// protocol" (which would mean the transport was built without TLS —
+    /// a regression that only manifests outside `file://` tests).
+    #[test]
+    fn https_transport_supports_https_scheme() {
+        let dir = temp_dir("https_probe");
+        let repo = gix::init_bare(&dir).expect("init bare");
+        let err = fetch_upstream(
+            &repo,
+            "https://nonexistent.invalid/repo.git",
+            "main",
+            "refs/synthesis/probe",
+        )
+        .expect_err("unroutable host must fail");
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            !msg.contains("unsupported protocol") && !msg.contains("disabled"),
+            "HTTPS transport unavailable: {err:#}"
+        );
+    }
 }
