@@ -1,19 +1,11 @@
-//! The git engine — the reconcile-toward-desired-state core.
+//! The synthesis engine — base plus ordered patches into one output branch.
 //!
-//! The engine operates on a local git working copy of the fork (mirrored).
-//! Everything is a pure function of the repository state, which makes the
-//! engine unit-testable against local bare repositories without any GitHub
-//! dependency.
-//!
-//! Branch roles:
-//! - `upstream/<X>` — mirror of upstream's `X` (fast-forward only), the stack
-//!   base that patch PRs target.
-//! - `<X>` — the recomposed artifact: upstream base tree + patch stack + fork
-//!   owned files. Hosts fork workflows and release tags.
+//! Everything operates on an ephemeral local bare repository and is a pure
+//! function of repository state, which makes the engine unit-testable against
+//! local bare repositories with no network.
 
 pub mod fetch;
 pub mod pipeline;
 pub mod push;
 pub mod rebase;
 pub mod stack;
-pub mod sync;

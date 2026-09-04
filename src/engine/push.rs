@@ -9,10 +9,10 @@
 //!
 //! gix 0.87 does not expose a push implementation in its public API — only
 //! fetch. Rather than blocking the milestone on a major gix upgrade, this
-//! module shells out to the `git` CLI for the push step. The call is
-//! synchronous and blocking, consistent with the rest of the git phase
-//! (fetch, sync, compose), and runs on a worker thread via
-//! [`tokio::task::spawn_blocking`].
+//! module shells out to the `git` CLI for the push step.
+//!
+//! The call is synchronous and blocking, consistent with the rest of the
+//! engine (fetch, compose).
 //!
 //! In tests, pushing against a local bare repository over a filesystem path
 //! exercises the full round-trip with no network needed.
@@ -45,6 +45,10 @@ pub struct PushResult {
 /// `Bearer <token>`) set via `git -c http.extraHeader`. When `None`, no
 /// authentication is configured (suitable for local bare repos in tests).
 ///
+/// When `force` is true each refspec is pushed with a `+` prefix, allowing
+/// non-fast-forward updates. Synthesis rewrites the output branch every run,
+/// so the output push is always forced.
+///
 /// This is blocking I/O — call from a worker thread in async contexts.
 ///
 /// # Errors
@@ -55,6 +59,7 @@ pub fn push_refs(
     remote_url: &str,
     refspecs: &[String],
     auth_header: Option<&str>,
+    force: bool,
 ) -> Result<PushResult> {
     if refspecs.is_empty() {
         return Ok(PushResult { pushed: vec![] });
@@ -72,7 +77,11 @@ pub fn push_refs(
     }
 
     for spec in refspecs {
-        cmd.arg(spec);
+        if force && !spec.starts_with('+') {
+            cmd.arg(format!("+{spec}"));
+        } else {
+            cmd.arg(spec);
+        }
     }
 
     let output = cmd.output().context("failed to execute git push")?;
@@ -90,13 +99,13 @@ pub fn push_refs(
 
 /// Parse the porcelain output of `git push --porcelain`.
 ///
-/// Lines starting with `*` (new/updated) or `=` (up-to-date) indicate
-/// successfully processed refs. The format is:
+/// Lines starting with `*` (new/updated), `+` (forced update), or `=`
+/// (up-to-date) indicate successfully processed refs. The format is:
 /// `<prefix> <from>:<to> [<status>]` where `<to>` is the remote ref.
 fn parse_push_output(stdout: &str) -> Vec<String> {
     stdout
         .lines()
-        .filter(|line| line.starts_with('*') || line.starts_with('='))
+        .filter(|line| line.starts_with('*') || line.starts_with('+') || line.starts_with('='))
         .filter_map(|line| {
             // Format: `<prefix>	<from>:<to>	[status]`
             // Split by tab, second field is "from:to"
@@ -109,36 +118,28 @@ fn parse_push_output(stdout: &str) -> Vec<String> {
         .collect()
 }
 
-/// Convenience: push the two maintained refs (artifact + mirror) to the fork.
+/// Push the synthesized output ref to its repository.
 ///
-/// `artifact_ref` is the local ref holding the recomposed artifact (e.g.
-/// `refs/heads/main`), `mirror_ref` is the local upstream mirror ref (e.g.
-/// `refs/heads/upstream/main`), and `remote_branch` is the fork's default
-/// branch name on GitHub (e.g. `main`).
+/// `output_ref` is the local ref holding the synthesized commit (e.g.
+/// `refs/heads/synthesized`), pushed to `refs/heads/<branch>` at
+/// `remote_url`. The push is always forced: synthesis rebuilds the branch
+/// from the base every run, so its history is routinely rewritten.
 ///
 /// `auth_header` is an optional `Authorization` header value for
 /// authenticated pushes (e.g. `Bearer <token>`).
 ///
-/// This pushes:
-/// - `<artifact_ref>` → `refs/heads/<remote_branch>` on the fork
-/// - `<mirror_ref>` → `refs/heads/<mirror_ref_name>` on the fork
-///
 /// # Errors
 ///
-/// Returns an error if either push fails.
-pub fn push_fork_refs(
+/// Returns an error if the push fails.
+pub fn push_output(
     repo_path: &Path,
     remote_url: &str,
-    artifact_ref: &str,
-    mirror_ref: &str,
-    remote_branch: &str,
+    output_ref: &str,
+    branch: &str,
     auth_header: Option<&str>,
 ) -> Result<PushResult> {
-    let artifact_spec = format!("{artifact_ref}:refs/heads/{remote_branch}");
-    let mirror_spec = format!("{mirror_ref}:{mirror_ref}");
-
-    let refspecs = vec![artifact_spec, mirror_spec];
-    push_refs(repo_path, remote_url, &refspecs, auth_header)
+    let spec = format!("{output_ref}:refs/heads/{branch}");
+    push_refs(repo_path, remote_url, &[spec], auth_header, true)
 }
 
 #[cfg(test)]
@@ -203,67 +204,76 @@ mod tests {
         assert_eq!(refs, vec!["refs/heads/main"]);
     }
 
+    /// Handle the `+` prefix for forced updates.
+    #[test]
+    fn parse_push_output_handles_forced_update() {
+        let stdout =
+            "To /tmp/target.git\n+\tHEAD:refs/heads/main\tab12cd..34ef56 (forced update)\nDone\n";
+        let refs = parse_push_output(stdout);
+        assert_eq!(refs, vec!["refs/heads/main"]);
+    }
+
     /// Empty refspec list is a no-op.
     #[test]
     fn push_refs_empty_is_noop() {
         let dir = temp_dir("empty");
         let _repo = gix::init_bare(&dir).expect("init bare");
-        let result = push_refs(&dir, "does-not-exist", &[], None).expect("noop");
+        let result = push_refs(&dir, "does-not-exist", &[], None, false).expect("noop");
         assert!(result.pushed.is_empty());
     }
 
-    /// Push two refs (artifact + mirror) to a local bare "fork" repo.
+    /// Push the synthesized output ref, forcing over a divergent remote.
     #[test]
-    fn push_fork_refs_pushes_artifact_and_mirror() {
-        // "Fork" on GitHub — a local bare repo.
-        let fork_dir = temp_dir("fork_remote");
-        let _fork = gix::init_bare(&fork_dir).expect("init fork bare");
+    fn push_output_forces_over_divergent_remote() {
+        // "Output repo" on GitHub — a local bare repo with its own history.
+        let remote_dir = temp_dir("output_remote");
+        let remote = gix::init_bare(&remote_dir).expect("init remote bare");
+        let old = commit_with_file(&remote, "a.txt", "old", "old history", None);
+        remote
+            .reference("refs/heads/main", old, PreviousValue::Any, "init remote")
+            .expect("set remote ref");
 
-        // Local mirror: bare repo with the two maintained refs.
-        let mirror_dir = temp_dir("mirror");
-        let mirror = gix::init_bare(&mirror_dir).expect("init mirror bare");
-
-        // Create two commits representing the artifact and mirror refs.
-        let c1 = commit_with_file(&mirror, "a.txt", "a1", "upstream c1", None);
-        let c2 = commit_with_file(&mirror, "b.txt", "b2", "artifact c1", Some(c1));
-
-        mirror
+        // Local scratch repo with an unrelated synthesized commit.
+        let local_dir = temp_dir("output_local");
+        let local = gix::init_bare(&local_dir).expect("init local bare");
+        let new = commit_with_file(&local, "a.txt", "new", "synthesized", None);
+        local
             .reference(
-                "refs/heads/upstream/main",
-                c1,
+                "refs/heads/synthesized",
+                new,
                 PreviousValue::Any,
-                "init mirror",
+                "init synthesized",
             )
-            .expect("set mirror ref");
-        mirror
-            .reference("refs/heads/main", c2, PreviousValue::Any, "init artifact")
-            .expect("set artifact ref");
+            .expect("set synthesized ref");
 
-        let fork_url = fork_dir.display().to_string();
+        // Non-forced push must fail (unrelated histories).
+        let err = push_refs(
+            &local_dir,
+            &remote_dir.display().to_string(),
+            &["refs/heads/synthesized:refs/heads/main".to_string()],
+            None,
+            false,
+        )
+        .expect_err("non-force push over divergent history should fail");
+        assert!(
+            err.to_string().contains("rejected"),
+            "unexpected error: {err}"
+        );
 
-        // Push both refs to the fork.
-        let result = push_fork_refs(
-            &mirror_dir,
-            &fork_url,
-            "refs/heads/main",
-            "refs/heads/upstream/main",
+        // push_output forces through.
+        let result = push_output(
+            &local_dir,
+            &remote_dir.display().to_string(),
+            "refs/heads/synthesized",
             "main",
             None,
         )
-        .expect("push_fork_refs");
+        .expect("push_output");
 
-        assert_eq!(result.pushed.len(), 2);
-        assert!(result.pushed.contains(&"refs/heads/main".to_string()));
-        assert!(
-            result
-                .pushed
-                .contains(&"refs/heads/upstream/main".to_string())
-        );
+        assert_eq!(result.pushed, vec!["refs/heads/main".to_string()]);
 
-        // Verify the fork now has both refs.
-        let fork = gix::open(&fork_dir).expect("open fork");
-        assert_eq!(ref_id(&fork, "refs/heads/main"), Some(c2));
-        assert_eq!(ref_id(&fork, "refs/heads/upstream/main"), Some(c1));
+        let remote = gix::open(&remote_dir).expect("open remote");
+        assert_eq!(ref_id(&remote, "refs/heads/main"), Some(new));
     }
 
     /// Push fails when the remote URL is invalid.
@@ -281,6 +291,7 @@ mod tests {
             "file:///nonexistent/path.git",
             &["refs/heads/main:refs/heads/main".to_string()],
             None,
+            false,
         );
         assert!(result.is_err(), "should fail for invalid remote");
     }
@@ -304,6 +315,7 @@ mod tests {
             &fork_dir.display().to_string(),
             &["refs/heads/main:refs/heads/main".to_string()],
             None,
+            false,
         )
         .expect("push single ref");
 

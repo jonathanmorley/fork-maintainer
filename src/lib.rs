@@ -1,27 +1,12 @@
-//! fork-maintainer — a GitHub App that maintains a fork on top of upstream.
+//! synthesize — build a declarative branch from a base plus ordered patches.
 //!
-//! The fork's default branch name is the *knob*: it selects which branch of
-//! the upstream repository to track. The fork's default branch *contents* are
-//! the *artifact*: upstream base tree + applied patch stack + fork-owned files.
+//! A [`config::SynthesisConfig`] declares a base branch and an ordered set of
+//! patch branches (each possibly in a different repository). The
+//! [`engine`] fetches them into an ephemeral local repo, composes base +
+//! patches in order, and force-pushes the single synthesized output branch.
 //!
-//! Branch roles (see `engine`):
-//! - `upstream/<X>` — pure mirror of upstream's branch `X`, fast-forward only.
-//!   This is the stack trunk that patch PRs target.
-//! - `<X>` (fork default) — the recomposed artifact hosting fork workflows and
-//!   release tags.
-//!
-//! The app is event-driven via GitHub webhooks, plus a poll loop for upstream
-//! drift. Webhooks fire only for the repositories the app is installed on, so
-//! an install on the *fork* delivers fork-side events (branch/PR activity) —
-//! it does *not* deliver upstream events, even though the fork is in the
-//! upstream's fork network (installs do not cascade across a network). Upstream
-//! drift on an otherwise idle fork is therefore only ever observed by the poll
-//! loop.
+//! The output branch is rebuilt from the base every run: never commit to it
+//! directly. All persistent content lives in the base or a patch branch.
 
 pub mod config;
 pub mod engine;
-pub mod github;
-pub mod mirror;
-pub mod poll;
-pub mod reconcile;
-pub mod webhook;

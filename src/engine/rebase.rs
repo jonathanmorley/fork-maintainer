@@ -156,9 +156,19 @@ impl Rebase for Merge {
 
             // Check for unresolved conflicts.
             if !outcome.conflicts.is_empty() {
+                let mut paths: Vec<String> = outcome
+                    .conflicts
+                    .iter()
+                    .map(|c| c.ours.location().to_string())
+                    .collect();
+                paths.sort();
+                paths.dedup();
                 anyhow::bail!(
-                    "conflicts detected while merging branch `{branch}`: {} conflicted entries",
-                    outcome.conflicts.len()
+                    "conflicts detected while merging patch `{branch}` at {} path(s): {}. \
+                     Resolve on the patch branch (never on the synthesized output) and re-run; \
+                     nothing was pushed",
+                    paths.len(),
+                    paths.join(", ")
                 );
             }
 
@@ -417,6 +427,14 @@ mod tests {
         assert!(
             err.to_string().contains("conflicts detected"),
             "expected conflict error, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("a.txt"),
+            "expected conflicted path in error, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("conflict-branch"),
+            "expected patch layer in error, got: {err}"
         );
     }
 
