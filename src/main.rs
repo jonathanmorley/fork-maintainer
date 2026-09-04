@@ -62,6 +62,14 @@ struct Args {
     /// enforcing it. Commit the result for review.
     #[arg(long)]
     update_lock: bool,
+    /// Maintenance update: refresh the lockfile and drop merged patches,
+    /// writing the caller files for review (never pushes or deletes).
+    /// Requires --config. Pair with --dry-run to preview.
+    #[arg(long)]
+    update: bool,
+    /// Preview file writes without executing them (with --update).
+    #[arg(long)]
+    dry_run: bool,
 }
 
 /// Committer identity stamped on synthesized commits; the timestamp is the
@@ -150,6 +158,65 @@ fn load_config(args: &Args) -> Result<SynthesisConfig> {
     Ok(cfg)
 }
 
+/// Maintenance update: refresh caller files for review.
+///
+/// Resolves current patch tips, collects PR states, plans file changes, and
+/// writes the config + lockfile (or previews with --dry-run). Never pushes
+/// output, deletes branches, or closes PRs.
+///
+/// Requires --config (the managed file pattern). Requires a token for PR
+/// state; without one the update cannot judge merges.
+fn run_update(args: &Args) -> Result<()> {
+    use fork_maintainer::update as maintenance;
+
+    let config_path = args
+        .config
+        .as_deref()
+        .context("--update requires --config (the managed file pattern)")?;
+    let raw = std::fs::read_to_string(config_path)
+        .with_context(|| format!("read config file {}", config_path.display()))?;
+    let cfg: SynthesisConfig = serde_json::from_str(&raw)
+        .with_context(|| format!("parse config {}", config_path.display()))?;
+    let lock_path = args
+        .lockfile
+        .clone()
+        .unwrap_or_else(|| fork_maintainer::lockfile::default_path(Some(config_path)));
+    let token = resolve_token(args.token.clone())
+        .context("--update needs a token for PR state (--token, SYNTH_TOKEN, or GITHUB_TOKEN)")?;
+
+    let github =
+        maintenance::GitHub::new("fork-maintainer/synthesize-update")?.with_token(token.clone());
+    let with_auth = |url: &str| authed_url(url, Some(&token));
+    let url_for = |repo: &fork_maintainer::config::Repo| with_auth(&repo.https_url());
+
+    let lock = fork_maintainer::lockfile::load(&lock_path)?;
+    let statuses = maintenance::observe_patches(&github, &cfg.patches, &cfg.output, &url_for)?;
+    let plan = maintenance::plan_updates(&statuses, lock.as_ref())?;
+
+    if plan.is_empty() {
+        println!("update: inputs current, nothing to propose");
+        return Ok(());
+    }
+    maintenance::apply_to_files(
+        config_path,
+        &lock_path,
+        &cfg,
+        &statuses,
+        &plan,
+        args.dry_run,
+    )?;
+    if args.dry_run {
+        println!("update: dry run, files unchanged");
+    } else {
+        println!(
+            "update: proposed {} removal{} and lock refresh; review the diff",
+            plan.removed.len(),
+            if plan.removed.len() == 1 { "" } else { "s" },
+        );
+    }
+    Ok(())
+}
+
 fn scratch_dir(workdir: Option<PathBuf>) -> Result<PathBuf> {
     let dir = match workdir {
         Some(dir) => dir,
@@ -170,6 +237,10 @@ fn scratch_dir(workdir: Option<PathBuf>) -> Result<PathBuf> {
 fn main() -> Result<()> {
     tracing_subscriber::fmt().with_target(false).init();
     let args = Args::parse();
+
+    if args.update {
+        return run_update(&args);
+    }
 
     let cfg = load_config(&args)?;
     let token = resolve_token(args.token);
@@ -239,6 +310,8 @@ mod tests {
             workdir: None,
             lockfile: None,
             update_lock: false,
+            update: false,
+            dry_run: false,
         }
     }
 

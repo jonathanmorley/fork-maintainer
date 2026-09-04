@@ -101,6 +101,21 @@ pinned); `--update-lock` re-resolves and rewrites — commit the result for
 review. The lockfile must be committed, or ephemeral runners degrade to
 perpetual bootstrap. Action inputs: `lockfile`, `update-lock`.
 
+## Update workflow
+
+`--update` (via `synthesize update`, or the `update.yml` reusable workflow)
+is the maintenance half of the lockfile: it resolves current patch tips and
+PR states, then rewrites the caller files — refreshing drifted SHAs and
+dropping patches whose PRs merged — for human review. It never pushes
+output, deletes branches, or closes PRs; synthesis itself stays read-only
+on inputs. A branch that vanished without a merged PR fails closed.
+
+The update workflow opens a PR with the rewritten config + lockfile on a
+schedule (weekly is a good default) and on `workflow_dispatch` (with a
+`dry-run` input for previews). Merge the proposal and the next synthesis
+reflects it. This subsumes branch-tidying: removal is proposed, never
+executed silently.
+
 ## Development
 
 ```bash
