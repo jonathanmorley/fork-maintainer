@@ -201,15 +201,14 @@ pub fn compose(
     let mut running = base_tree_id;
 
     for branch in branches {
-        // The branch head commit's own base tree (first-parent) is what the
-        // branch was forked from; diff against it so upstream-only changes
-        // made after the fork are not attributed to the branch.
+        // The branch's fork point — its merge-base with the base tip — is
+        // what the branch conceptually started from. Diffing tip against it
+        // captures the branch's *entire* unique content (all of its commits),
+        // so upstream-only changes made after the fork are never attributed
+        // to the branch. (An immediate parent would only capture the last
+        // commit and silently drop the rest on multi-commit branches.)
         let (head_tree, head_oid) = peel_tree_and_commit(repo, branch)?;
-        let head = repo.find_commit(head_oid)?;
-        let branch_base = match head.parent_ids().next() {
-            Some(parent) => repo.find_commit(parent)?.tree_id()?.detach(),
-            None => repo.empty_tree().id,
-        };
+        let branch_base = fork_point_tree(repo, head_oid, base_commit)?;
 
         let from_tree = repo.find_tree(branch_base)?;
         let to_tree = repo.find_tree(head_tree)?;
@@ -244,6 +243,25 @@ fn peel_tree_and_commit(
     let oid = repo.find_reference(ref_name)?.id().detach();
     let commit = repo.find_commit(oid)?;
     Ok((commit.tree_id()?.detach(), oid))
+}
+
+/// The fork-point tree for layering `tip` onto a base at `base_oid`: the
+/// tree of their merge-base.
+///
+/// When the histories are disjoint (no merge-base — e.g. root-commit test
+/// fixtures, or a patch branch sharing nothing with the base), the empty
+/// tree is the correct ancestor: the branch's entire content is its own.
+pub(crate) fn fork_point_tree(
+    repo: &Repository,
+    tip: gix::ObjectId,
+    base_oid: gix::ObjectId,
+) -> Result<gix::ObjectId> {
+    use gix::repository::merge_base::Error as MergeBaseError;
+    match repo.merge_base(tip, base_oid) {
+        Ok(mb) => Ok(repo.find_commit(mb.detach())?.tree_id()?.detach()),
+        Err(MergeBaseError::NotFound { .. }) => Ok(repo.empty_tree().id),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Read the tree that a ref's commit points to.
@@ -614,6 +632,53 @@ mod tests {
         assert_eq!(
             tree_blob(&repo, outcome.tree, ".github/ci.yml").as_deref(),
             Some("workflow")
+        );
+    }
+
+    /// A multi-commit patch branch contributes *all* of its commits, not just
+    /// the tip's diff against its immediate parent.
+    #[test]
+    fn multi_commit_branch_applies_every_commit() {
+        let dir = temp_dir("multi_commit");
+        let repo = init_bare(&dir);
+
+        let base = commit_with_files(&repo, &[("a.txt", "a1")], "base", None);
+        set_ref(&repo, "refs/heads/upstream/main", base);
+
+        // Patch branch with two commits sharing the base's history: the first
+        // adds feat.txt, the second modifies a.txt.
+        let c1 = commit_with_files(
+            &repo,
+            &[("a.txt", "a1"), ("feat.txt", "f")],
+            "add feat",
+            Some(base),
+        );
+        let c2 = commit_with_files(
+            &repo,
+            &[("a.txt", "a2"), ("feat.txt", "f")],
+            "tweak a",
+            Some(c1),
+        );
+        set_ref(&repo, "refs/heads/feature", c2);
+
+        let outcome = compose(
+            &repo,
+            "refs/heads/upstream/main",
+            &["refs/heads/feature".to_string()],
+            "refs/heads/main",
+            sig(),
+        )
+        .expect("compose");
+
+        // Both the early commit's file and the tip's modification survive.
+        // (Against an immediate-parent ancestor, feat.txt would be missing.)
+        assert_eq!(
+            tree_blob(&repo, outcome.tree, "feat.txt").as_deref(),
+            Some("f")
+        );
+        assert_eq!(
+            tree_blob(&repo, outcome.tree, "a.txt").as_deref(),
+            Some("a2")
         );
     }
 

@@ -136,11 +136,11 @@ impl Rebase for Merge {
             let branch_commit = repo.find_commit(branch_oid)?;
             let branch_tree = branch_commit.tree_id()?.detach();
 
-            // The branch's fork point is its first parent (or empty tree).
-            let ancestor_tree = match branch_commit.parent_ids().next() {
-                Some(parent) => repo.find_commit(parent)?.tree_id()?.detach(),
-                None => repo.empty_tree().id,
-            };
+            // The patch's fork point — its merge-base with the base tip — is
+            // the ancestor. This captures the patch's entire unique content
+            // (all of its commits), unlike an immediate parent which would
+            // only capture the last commit on multi-commit branches.
+            let ancestor_tree = crate::engine::stack::fork_point_tree(repo, branch_oid, base_oid)?;
 
             // Perform 3-way merge: ours=running, theirs=branch, ancestor=branch's fork point.
             let labels = gix::merge::blob::builtin_driver::text::Labels {

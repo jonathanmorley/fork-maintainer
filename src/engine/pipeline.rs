@@ -448,4 +448,65 @@ mod tests {
         .expect_err("missing patch should fail");
         assert!(err.to_string().contains("nope"), "got: {err}");
     }
+
+    /// Merge strategy applies every commit of a multi-commit patch branch.
+    #[test]
+    fn merge_applies_multi_commit_patch_fully() {
+        let upstream_dir = temp_dir("up5");
+        let upstream = gix::init_bare(&upstream_dir).expect("init upstream");
+        let base = commit_with_files(&upstream, &[("a.txt", "a1")], "base", None);
+        set_ref(&upstream, "refs/heads/main", base);
+
+        // Patch repo: two commits sharing history. The root replicates the
+        // upstream base commit byte-for-byte (same files, message, sig), so
+        // both object stores unify on one SHA and merge-base links the
+        // histories — exactly as fetched real branches do. The first patch
+        // commit adds feat.txt, the second modifies a.txt.
+        let patch_dir = temp_dir("patch5");
+        let patch_repo = gix::init_bare(&patch_dir).expect("init patch repo");
+        let c0 = commit_with_files(&patch_repo, &[("a.txt", "a1")], "base", None);
+        assert_eq!(c0, base, "replicated root must unify with upstream base");
+        let c1 = commit_with_files(
+            &patch_repo,
+            &[("a.txt", "a1"), ("feat.txt", "f")],
+            "add feat",
+            Some(c0),
+        );
+        let c2 = commit_with_files(
+            &patch_repo,
+            &[("a.txt", "a2"), ("feat.txt", "f")],
+            "tweak a",
+            Some(c1),
+        );
+        set_ref(&patch_repo, "refs/heads/feature", c2);
+
+        let output_dir = temp_dir("out5");
+        let _output = gix::init_bare(&output_dir).expect("init output");
+
+        let scratch_dir = temp_dir("scratch5");
+        let scratch = gix::init_bare(&scratch_dir).expect("init scratch");
+
+        let out = synthesize_with_urls(
+            &scratch,
+            &url(&upstream_dir),
+            "main",
+            &[(url(&patch_dir), "feature".to_string())],
+            &url(&output_dir),
+            "main",
+            Strategy::Merge,
+            sig(),
+        )
+        .expect("synthesize");
+
+        assert!(out.pushed);
+        // Both the early commit's file and the tip's modification land.
+        assert_eq!(
+            tree_blob(&scratch, out.tree, "feat.txt").as_deref(),
+            Some("f")
+        );
+        assert_eq!(
+            tree_blob(&scratch, out.tree, "a.txt").as_deref(),
+            Some("a2")
+        );
+    }
 }
