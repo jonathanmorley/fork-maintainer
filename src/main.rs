@@ -41,8 +41,8 @@ struct Args {
     /// Output branch as `owner/name@branch`.
     #[arg(long)]
     output: Option<String>,
-    /// Composition strategy: `overlay` or `merge`. Overrides the config file
-    /// when given; defaults to the file's value, else `merge`.
+    /// Composition strategy: `overlay`, `merge`, or `replay`. Overrides the
+    /// config file when given; defaults to the file's value, else `merge`.
     #[arg(long)]
     strategy: Option<String>,
     /// Token for HTTPS git access. Falls back to `SYNTH_TOKEN`, then

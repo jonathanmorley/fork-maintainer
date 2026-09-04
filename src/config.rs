@@ -115,10 +115,16 @@ pub enum Strategy {
     /// the run before anything is pushed. Correctness over availability.
     #[default]
     Merge,
+    /// Cherry-pick replay: each commit unique to a patch is re-applied in
+    /// order with its original message and author (plus a
+    /// `Synthesized-from:` trailer). Linear-only; merge commits in range,
+    /// no-op commits, and already-upstream layers are handled explicitly.
+    /// Conflicts fail per commit with patch, commit, and paths named.
+    Replay,
 }
 
 impl Strategy {
-    /// Parse a strategy name; valid values are `overlay` and `merge`.
+    /// Parse a strategy name; valid values are `overlay`, `merge`, `replay`.
     ///
     /// # Errors
     ///
@@ -127,7 +133,8 @@ impl Strategy {
         match name {
             "overlay" => Ok(Self::Overlay),
             "merge" => Ok(Self::Merge),
-            other => anyhow::bail!("unknown strategy `{other}` (valid: overlay, merge)"),
+            "replay" => Ok(Self::Replay),
+            other => anyhow::bail!("unknown strategy `{other}` (valid: overlay, merge, replay)"),
         }
     }
 }
@@ -195,6 +202,7 @@ mod tests {
     fn strategy_parses_known_names() {
         assert_eq!(Strategy::parse("overlay").unwrap(), Strategy::Overlay);
         assert_eq!(Strategy::parse("merge").unwrap(), Strategy::Merge);
+        assert_eq!(Strategy::parse("replay").unwrap(), Strategy::Replay);
         assert!(Strategy::parse("rebase").is_err());
     }
 
