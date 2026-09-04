@@ -26,7 +26,6 @@ use crate::config::{BranchRef, Strategy};
 use crate::engine::fetch::fetch_upstream;
 use crate::engine::push::push_output;
 use crate::engine::rebase::{ComposeOutcome, Merge, Overlay, Rebase};
-
 /// Local ref holding the fetched base.
 const BASE_REF: &str = "refs/synthesis/base";
 /// Local ref holding the freshly composed output before push.
@@ -121,6 +120,7 @@ pub fn synthesize(
     patches: &[BranchRef],
     output: &BranchRef,
     strategy: Strategy,
+    lock: &crate::lockfile::LockOptions,
     committer: SignatureRef<'_>,
 ) -> Result<SynthesizeOutcome> {
     synthesize_with_urls(
@@ -129,11 +129,12 @@ pub fn synthesize(
         &base.branch,
         &patches
             .iter()
-            .map(|p| (p.repo.https_url(), p.branch.clone()))
+            .map(|p| (p.clone(), p.repo.https_url()))
             .collect::<Vec<_>>(),
         &output.repo.https_url(),
         &output.branch,
         strategy,
+        lock,
         committer,
     )
 }
@@ -143,25 +144,37 @@ pub fn synthesize(
 /// Callers embed tokens into HTTPS URLs (see
 /// [`crate::config::Repo::authed_https_url`]) before calling; `file://` and
 /// plain paths work unchanged for tests and local runs.
+///
+/// Patches carry their [`BranchRef`] alongside the transport URL so resolved
+/// tips stay attributable for lockfile enforcement.
 #[allow(clippy::too_many_arguments)]
 pub fn synthesize_with_urls(
     repo: &Repository,
     base_url: &str,
     base_branch: &str,
-    patches: &[(String, String)],
+    patches: &[(BranchRef, String)],
     output_url: &str,
     output_branch: &str,
     strategy: Strategy,
+    lock: &crate::lockfile::LockOptions,
     committer: SignatureRef<'_>,
 ) -> Result<SynthesizeOutcome> {
     // 1. Fetch the base and every patch branch into local refs.
-    fetch_branch(repo, base_url, base_branch, BASE_REF)?;
+    let base_tip = fetch_branch(repo, base_url, base_branch, BASE_REF)?;
+    tracing::info!(base = %format!("{base_url}#{base_branch}"), tip = %base_tip, "fetched base");
     let mut patch_refs = Vec::with_capacity(patches.len());
-    for (i, (url, branch)) in patches.iter().enumerate() {
+    let mut resolved = Vec::with_capacity(patches.len());
+    for (i, (branch, url)) in patches.iter().enumerate() {
         let local = format!("refs/synthesis/patch-{i}");
-        fetch_branch(repo, url, branch, &local)?;
+        let oid = fetch_branch(repo, url, &branch.branch, &local)?;
+        tracing::info!(patch = %branch, tip = %oid, "fetched patch");
         patch_refs.push(local);
+        resolved.push((branch.clone(), oid));
     }
+
+    // 1b. Pin patches: enforce (or bootstrap/update) the lockfile before
+    // anything composes or pushes.
+    crate::lockfile::enforce(lock, &resolved)?;
 
     // 2. Compose the output from base + patches in order. Replay preserves
     // each unique commit; overlay/merge squash each layer into one commit.
@@ -289,6 +302,28 @@ mod tests {
         dir.display().to_string()
     }
 
+    /// A patch source for tests: a BranchRef identity plus its transport URL.
+    fn patch_src(owner: &str, name: &str, url: String, branch: &str) -> (BranchRef, String) {
+        (
+            BranchRef {
+                repo: crate::config::Repo {
+                    owner: owner.into(),
+                    name: name.into(),
+                },
+                branch: branch.into(),
+            },
+            url,
+        )
+    }
+
+    /// Locking disabled (legacy auto-follow) for tests not exercising pins.
+    fn no_lock() -> crate::lockfile::LockOptions {
+        crate::lockfile::LockOptions {
+            path: None,
+            update: false,
+        }
+    }
+
     /// Base + one cross-repo patch compose and push the output branch.
     #[test]
     fn synthesizes_base_plus_cross_repo_patch() {
@@ -321,10 +356,11 @@ mod tests {
             &scratch,
             &url(&upstream_dir),
             "main",
-            &[(url(&patch_dir), "feature".to_string())],
+            &[patch_src("other", "repo", url(&patch_dir), "feature")],
             &url(&output_dir),
             "main",
             Strategy::Merge,
+            &no_lock(),
             sig(),
         )
         .expect("synthesize");
@@ -369,6 +405,7 @@ mod tests {
                 &url(&output_dir),
                 "main",
                 Strategy::Overlay,
+                &no_lock(),
                 sig(),
             )
             .expect("synthesize")
@@ -423,12 +460,13 @@ mod tests {
             &url(&upstream_dir),
             "main",
             &[
-                (url(&repo_a_dir), "a".to_string()),
-                (url(&repo_b_dir), "b".to_string()),
+                patch_src("a-org", "repo", url(&repo_a_dir), "a"),
+                patch_src("b-org", "repo", url(&repo_b_dir), "b"),
             ],
             &url(&output_dir),
             "main",
             Strategy::Merge,
+            &no_lock(),
             sig(),
         )
         .expect_err("conflicting patches should fail");
@@ -465,10 +503,11 @@ mod tests {
             &scratch,
             &url(&upstream_dir),
             "main",
-            &[(url(&upstream_dir), "nope".to_string())],
+            &[patch_src("up", "repo", url(&upstream_dir), "nope")],
             &url(&output_dir),
             "main",
             Strategy::Overlay,
+            &no_lock(),
             sig(),
         )
         .expect_err("missing patch should fail");
@@ -516,10 +555,11 @@ mod tests {
             &scratch,
             &url(&upstream_dir),
             "main",
-            &[(url(&patch_dir), "feature".to_string())],
+            &[patch_src("other", "repo", url(&patch_dir), "feature")],
             &url(&output_dir),
             "main",
             Strategy::Merge,
+            &no_lock(),
             sig(),
         )
         .expect("synthesize");
@@ -594,12 +634,13 @@ mod tests {
             &url(&remote_dir),
             "main",
             &[
-                (url(&remote_dir), "patch-a".to_string()),
-                (url(&remote_dir), "patch-b".to_string()),
+                patch_src("sim", "repo", url(&remote_dir), "patch-a"),
+                patch_src("sim", "repo", url(&remote_dir), "patch-b"),
             ],
             &url(&output_dir),
             "main",
             Strategy::Merge,
+            &no_lock(),
             sig(),
         )
         .expect("similar files across patches must merge cleanly");
@@ -653,10 +694,11 @@ mod tests {
                 &scratch,
                 &url(&upstream_dir),
                 "main",
-                &[(url(&patch_dir), "feature".to_string())],
+                &[patch_src("rpatch", "repo", url(&patch_dir), "feature")],
                 &url(&output_dir),
                 "main",
                 Strategy::Replay,
+                &no_lock(),
                 sig(),
             )
             .expect("synthesize")
@@ -689,5 +731,87 @@ mod tests {
             Some(tip),
             "output ref untouched"
         );
+    }
+
+    /// Lockfile: bootstrap on first run, enforce on later runs, fail drift.
+    #[test]
+    fn lockfile_bootstrap_enforce_and_drift() {
+        use crate::lockfile::LockOptions;
+
+        let upstream_dir = temp_dir("lup");
+        let upstream = gix::init_bare(&upstream_dir).expect("init upstream");
+        let base = commit_with_files(&upstream, &[("a.txt", "a1")], "base", None);
+        set_ref(&upstream, "refs/heads/main", base);
+
+        let patch_dir = temp_dir("lpatch");
+        let patch_repo = gix::init_bare(&patch_dir).expect("init patch repo");
+        let p1 = commit_with_files(&patch_repo, &[("a.txt", "a1"), ("f.txt", "f")], "p1", None);
+        set_ref(&patch_repo, "refs/heads/feature", p1);
+
+        let output_dir = temp_dir("lout");
+        let _output = gix::init_bare(&output_dir).expect("init output");
+
+        let lock_path = temp_dir("llock").join("synthesis.lock");
+        let run = |tag: &str, lock: &LockOptions| {
+            let scratch_dir = temp_dir(&format!("lscratch-{tag}"));
+            let scratch = gix::init_bare(&scratch_dir).expect("init scratch");
+            synthesize_with_urls(
+                &scratch,
+                &url(&upstream_dir),
+                "main",
+                &[patch_src("lp", "repo", url(&patch_dir), "feature")],
+                &url(&output_dir),
+                "main",
+                Strategy::Overlay,
+                lock,
+                sig(),
+            )
+        };
+
+        // First run bootstraps the lockfile (and pushes: fresh output).
+        let update = LockOptions {
+            path: Some(lock_path.clone()),
+            update: true,
+        };
+        let first = run("a", &update).expect("bootstrap run");
+        assert!(first.pushed);
+        assert!(lock_path.exists(), "update run writes lockfile");
+        let raw = std::fs::read_to_string(&lock_path).expect("read lock");
+        assert!(raw.contains(&p1.to_string()), "lock records patch tip");
+
+        // Second run enforces the unchanged lock.
+        let enforce = LockOptions {
+            path: Some(lock_path.clone()),
+            update: false,
+        };
+        let second = run("b", &enforce).expect("enforcing run passes");
+        assert!(!second.pushed, "same inputs: quiet no-op");
+
+        // Advance the patch branch: enforcement must fail naming the drift,
+        // before anything composes or pushes.
+        let p2 = commit_with_files(
+            &patch_repo,
+            &[("a.txt", "a1"), ("f.txt", "f"), ("g.txt", "g")],
+            "p2",
+            Some(p1),
+        );
+        set_ref(&patch_repo, "refs/heads/feature", p2);
+        let err = run("c", &enforce).expect_err("moved patch must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("lp/repo@feature"), "names patch, got: {msg}");
+        assert!(
+            msg.contains(&p1.to_string()),
+            "names locked sha, got: {msg}"
+        );
+        assert!(
+            msg.contains(&p2.to_string()),
+            "names actual sha, got: {msg}"
+        );
+
+        // Re-locking accepts the new tip.
+        let third = run("d", &update).expect("re-lock run");
+        assert!(third.pushed, "new content pushes after re-lock");
+        let raw = std::fs::read_to_string(&lock_path).expect("read lock");
+        assert!(raw.contains(&p2.to_string()), "lock updated to new tip");
     }
 }

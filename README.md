@@ -87,6 +87,20 @@ compact `owner/name@branch`. The token resolves as `--token`, then
 `SYNTH_TOKEN`, then `GITHUB_TOKEN`. Exit 0 on success including no-ops;
 non-zero with the error on stderr otherwise.
 
+## Lockfile
+
+Patches from repositories you do not control are untrusted input: without
+pinning, anyone with write access to a patch repo silently lands code on
+the output branch at the next run. `--lockfile` (default `synthesis.lock`
+next to `--config`) records every patch's exact SHA, and runs enforce it —
+a moved tip fails before anything composes or pushes, naming expected vs
+actual SHAs. The base branch intentionally floats (tracking a tip is the
+declared intent); only patches are pinned, and the base SHA is logged every
+run. A missing lockfile bootstraps one with a loud warning (review what got
+pinned); `--update-lock` re-resolves and rewrites — commit the result for
+review. The lockfile must be committed, or ephemeral runners degrade to
+perpetual bootstrap. Action inputs: `lockfile`, `update-lock`.
+
 ## Development
 
 ```bash

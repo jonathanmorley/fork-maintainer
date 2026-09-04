@@ -92,6 +92,15 @@ inputs:
     description: "Token with read access to base/patches and write access to output"
     required: false
     default: ""
+  lockfile:
+    description: "Path to the patch lockfile (relative to the caller checkout). Defaults to synthesis.lock in the checkout root; patches are pinned and drift fails the run."
+    required: false
+    default: "synthesis.lock"
+  update-lock:
+    description: "Re-resolve every patch tip and rewrite the lockfile instead of enforcing it. Commit the result for review."
+    required: false
+    default: false
+    type: boolean
 
 outputs:
   pushed:
@@ -159,11 +168,16 @@ runs:
         SYNTH_TOKEN: ${{ inputs.token != '' && inputs.token || steps.sts.outputs.token }}
         GITHUB_TOKEN: ${{ github.token }}
       run: |
+        LOCK_ARGS="--lockfile ${{ inputs.lockfile }}"
+        if [ "${{ inputs.update-lock }}" = "true" ]; then
+          LOCK_ARGS="$LOCK_ARGS --update-lock"
+        fi
         SYNTH_OUT=$(./engine/target/release/synthesize \
           --base "${{ inputs.base }}" \
           $PATCH_ARGS \
           --output "${{ inputs.output }}" \
-          --strategy "${{ inputs.strategy }}" 2>&1 | tee /dev/stderr)
+          --strategy "${{ inputs.strategy }}" \
+          $LOCK_ARGS 2>&1 | tee /dev/stderr)
         LAST_LINE=$(printf '%s\n' "$SYNTH_OUT" | grep -E '^(pushed |no change: )' | tail -n 1)
         case "$LAST_LINE" in
           pushed\ *)

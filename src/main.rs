@@ -53,6 +53,15 @@ struct Args {
     /// directory under the system temp dir.
     #[arg(long)]
     workdir: Option<PathBuf>,
+    /// Path to the patch lockfile. Defaults to `synthesis.lock` next to
+    /// `--config`, else `./synthesis.lock`. Patches are pinned: a missing
+    /// lockfile bootstraps (with a loud warning), drift fails the run.
+    #[arg(long)]
+    lockfile: Option<PathBuf>,
+    /// Re-resolve every patch tip and rewrite the lockfile instead of
+    /// enforcing it. Commit the result for review.
+    #[arg(long)]
+    update_lock: bool,
 }
 
 /// Committer identity stamped on synthesized commits; the timestamp is the
@@ -176,6 +185,14 @@ fn main() -> Result<()> {
     let repo =
         gix::init_bare(&dir).with_context(|| format!("init bare repo at {}", dir.display()))?;
     let with_auth = |url: &str| authed_url(url, token.as_deref());
+    let lock = fork_maintainer::lockfile::LockOptions {
+        path: args.lockfile.clone().or_else(|| {
+            Some(fork_maintainer::lockfile::default_path(
+                args.config.as_deref(),
+            ))
+        }),
+        update: args.update_lock,
+    };
 
     let out = synthesize_with_urls(
         &repo,
@@ -183,11 +200,12 @@ fn main() -> Result<()> {
         &cfg.base.branch,
         &cfg.patches
             .iter()
-            .map(|p| (with_auth(&p.repo.https_url()), p.branch.clone()))
+            .map(|p| (p.clone(), with_auth(&p.repo.https_url())))
             .collect::<Vec<_>>(),
         &with_auth(&cfg.output.repo.https_url()),
         &cfg.output.branch,
         cfg.strategy,
+        &lock,
         committer()?,
     )?;
 
@@ -219,6 +237,8 @@ mod tests {
             strategy: None,
             token: None,
             workdir: None,
+            lockfile: None,
+            update_lock: false,
         }
     }
 
