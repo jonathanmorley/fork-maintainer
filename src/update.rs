@@ -30,6 +30,19 @@ pub struct PrSummary {
     pub merged: bool,
 }
 
+/// An open pull request with full head identity, for patch discovery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenPr {
+    /// Pull request number (ordering + log lines).
+    pub number: u64,
+    /// Owner of the repository holding the head branch.
+    pub head_owner: String,
+    /// Repository holding the head branch.
+    pub head_name: String,
+    /// The head branch name.
+    pub head_ref: String,
+}
+
 /// Observed live state for one declared patch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PatchStatus {
@@ -176,11 +189,59 @@ impl GitHub {
     ///
     /// Returns an error on transport failure or non-success status.
     pub fn prs_for_head(&self, repo: &crate::config::Repo, head: &str) -> Result<Vec<PrSummary>> {
-        let mut out = Vec::new();
-        let mut url = format!(
+        let url = format!(
             "https://api.github.com/repos/{}/pulls?head={head}&state=all&per_page=100",
             repo.slug()
         );
+        let what = format!("PRs with head `{head}` in {}", repo.slug());
+        Ok(self
+            .get_all(&url, &what)?
+            .iter()
+            .filter_map(|pr| {
+                Some(PrSummary {
+                    number: pr.get("number")?.as_u64()?,
+                    merged: pr.get("merged_at")?.is_string(),
+                })
+            })
+            .collect())
+    }
+
+    /// List open PRs in `repo` with full head identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on transport failure or non-success status.
+    pub fn open_prs(&self, repo: &crate::config::Repo) -> Result<Vec<OpenPr>> {
+        let url = format!(
+            "https://api.github.com/repos/{}/pulls?state=open&per_page=100",
+            repo.slug()
+        );
+        let what = format!("open PRs in {}", repo.slug());
+        Ok(self
+            .get_all(&url, &what)?
+            .iter()
+            .filter_map(|pr| {
+                let head = pr.get("head")?;
+                let head_repo = head.get("repo")?;
+                Some(OpenPr {
+                    number: pr.get("number")?.as_u64()?,
+                    head_owner: head_repo.get("owner")?.get("login")?.as_str()?.to_string(),
+                    head_name: head_repo.get("name")?.as_str()?.to_string(),
+                    head_ref: head.get("ref")?.as_str()?.to_string(),
+                })
+            })
+            .collect())
+    }
+
+    /// GET a paginated API collection, following `rel="next"` links.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on transport failure, non-success status, or
+    /// unparseable pages.
+    fn get_all(&self, url: &str, what: &str) -> Result<Vec<serde_json::Value>> {
+        let mut out = Vec::new();
+        let mut url = url.to_string();
         loop {
             let mut req = self
                 .client
@@ -189,24 +250,16 @@ impl GitHub {
             if let Some(t) = &self.token {
                 req = req.bearer_auth(t);
             }
-            let resp = req
-                .send()
-                .with_context(|| format!("list PRs with head `{head}` in {}", repo.slug()))?;
+            let resp = req.send().with_context(|| format!("list {what}"))?;
             let status = resp.status();
             if !status.is_success() {
-                anyhow::bail!(
-                    "list PRs with head `{head}` in {} failed: HTTP {status}",
-                    repo.slug()
-                );
+                anyhow::bail!("list {what} failed: HTTP {status}");
             }
             let next = next_link(resp.headers());
-            let page: Vec<serde_json::Value> = resp.json().context("parse PR list response")?;
-            out.extend(page.iter().filter_map(|pr| {
-                Some(PrSummary {
-                    number: pr.get("number")?.as_u64()?,
-                    merged: pr.get("merged_at")?.is_string(),
-                })
-            }));
+            let page: Vec<serde_json::Value> = resp
+                .json()
+                .with_context(|| format!("parse {what} response"))?;
+            out.extend(page);
             match next {
                 Some(n) => url = n,
                 None => break,
