@@ -120,7 +120,12 @@ jobs:
 
       - name: Run synthesize
         env:
+          # Prefer the caller-provided secret; fall back to this run's own
+          # token (the CLI resolves SYNTH_TOKEN, then GITHUB_TOKEN).
+          # Belt-and-suspenders: secret transport to reusable workflows has
+          # been observed to arrive empty while github.token is populated.
           SYNTH_TOKEN: ${{ secrets.token }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: >
           ./engine/target/release/synthesize
           --base "${{ inputs.base }}"
