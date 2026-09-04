@@ -1,31 +1,37 @@
 # synthesize
 
-A declarative branch synthesizer, delivered as a reusable GitHub Actions
-workflow. Declare a base branch plus an ordered set of patch branches —
-each possibly in a **different repository** — and get one synthesized output
-branch, rebuilt from the base on every run.
+A declarative branch synthesizer, delivered as a GitHub Action. Declare a
+base branch plus an ordered set of patch branches — each possibly in a
+**different repository** — and get one synthesized output branch, rebuilt
+from the base on every run.
 
 ```yaml
 # in your fork, e.g. .github/workflows/sync.yml
+on:
+  schedule: [{ cron: "0 6 * * *" }]   # upstream drift
+  push: { branches: [main] }          # fork-side changes (optional)
+  workflow_dispatch: {}               # manual runs
+
 jobs:
   synthesize:
-    uses: jonathanmorley/fork-maintainer/.github/workflows/synthesize.yml@<sha>
-    with:
-      base: integrations/terraform-provider-github@main
-      patches: |
-        myorg/terraform-provider-github@fork-owned
-        myorg/terraform-provider-github@feature-a
-      output: myorg/terraform-provider-github@main
-    secrets:
-      token: ${{ secrets.SYNTH_TOKEN }}
-    permissions:
-      contents: write
+    runs-on: ubuntu-latest
+    permissions: { contents: write }  # + id-token: write when using sts
+    concurrency: { group: synthesize-main, cancel-in-progress: false }
+    steps:
+      - uses: jonathanmorley/fork-maintainer@v1
+        id: synthesize
+        with:
+          base: integrations/terraform-provider-github@main
+          patches: |
+            myorg/terraform-provider-github@fork-owned
+            myorg/terraform-provider-github@feature-a
+          output: myorg/terraform-provider-github@main
+          token: ${{ secrets.SYNTH_TOKEN }}   # or github.token (see below)
 ```
 
-Add your own triggers in the caller (`schedule` for upstream drift,
-`push`/`pull_request` for fork-side changes, `workflow_dispatch` for manual
-runs). Synthesis is idempotent: when the output already carries the composed
-tree, the run is a quiet no-op.
+The step exposes outputs `pushed` (`true`/`false`) and `commit` for
+downstream steps. Synthesis is idempotent: when the output already carries
+the composed tree, the run is a quiet no-op (`pushed: false`).
 
 ## How it works
 
@@ -53,17 +59,20 @@ Each run, in an ephemeral runner with no persistent state:
 
 ## Tokens and permissions
 
-- The caller must grant `contents: write`.
-- The `token` secret defaults to `${{ github.token }}` in the caller, which
-  is enough for public upstreams. Two limitations to know:
+- The calling job must grant `contents: write` (plus `id-token: write` when
+  using `sts-scope`/`sts-identity`).
+- Token precedence: explicit `token` input, then an sts mint when
+  `sts-scope` + `sts-identity` are set, then `github.token`, then anonymous
+  access (public repos only). Two limitations to know:
   - Pushes made with `github.token` **do not trigger downstream workflows**.
-    Pass a PAT (or App token) as `token` if CI must run on the output.
+    Pass a PAT, App token, or sts-minted token as `token` if CI must run on
+    the output.
   - Private upstreams need a token with read access to that repo (a fork's
     `github.token` cannot see someone else's private repo).
 
 ## CLI
 
-The workflow wraps the `synthesize` binary in this repo (same interface):
+The action wraps the `synthesize` binary in this repo (same interface):
 
 ```bash
 synthesize --base integrations/repo@main \
