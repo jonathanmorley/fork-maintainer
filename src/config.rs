@@ -139,14 +139,50 @@ impl Strategy {
     }
 }
 
+/// A declared patch layer: which branch, and whether its tip is pinned.
+///
+/// `pin` defaults to true: third-party branches are locked to exact SHAs so
+/// a moved tip fails the run instead of silently landing new code. Set
+/// `pin: false` only for first-party branches you push yourself (e.g. a
+/// `fork-owned` overlay) — there is no one else to review, so floating is
+/// honest and avoids the self-reference trap of pinning a branch that
+/// carries its own lockfile.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PatchSpec {
+    /// The patch branch (flattened: `{"repo": ..., "branch": ...}`).
+    #[serde(flatten)]
+    pub branch: BranchRef,
+    /// Pin the tip in the lockfile. Defaults to true.
+    #[serde(default = "pin_default_true", skip_serializing_if = "is_true")]
+    pub pin: bool,
+}
+
+fn pin_default_true() -> bool {
+    true
+}
+
+fn is_true(b: &bool) -> bool {
+    *b
+}
+
+impl PatchSpec {
+    /// A pinned patch from its parts (what `--patch` flags produce).
+    pub fn pinned(repo: Repo, branch: String) -> Self {
+        Self {
+            branch: BranchRef { repo, branch },
+            pin: true,
+        }
+    }
+}
+
 /// The full declarative synthesis spec.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SynthesisConfig {
     /// The base branch the artifact is rebuilt from every run.
     pub base: BranchRef,
-    /// Ordered patch branches, applied bottom-first onto the base.
+    /// Ordered patch layers, applied bottom-first onto the base.
     #[serde(default)]
-    pub patches: Vec<BranchRef>,
+    pub patches: Vec<PatchSpec>,
     /// Where the synthesized commit is force-pushed.
     pub output: BranchRef,
     /// Composition strategy. Defaults to `merge`.
@@ -215,5 +251,27 @@ mod tests {
         let cfg: SynthesisConfig = serde_json::from_str(json).expect("parse");
         assert_eq!(cfg.strategy, Strategy::Merge);
         assert!(cfg.patches.is_empty());
+    }
+
+    #[test]
+    fn patch_pin_defaults_true_and_parses_explicit_false() {
+        // Bare form (backward compatible): pinned.
+        let json = r#"{
+            "base": {"repo": {"owner": "u", "name": "r"}, "branch": "main"},
+            "patches": [
+                {"repo": {"owner": "f", "name": "r"}, "branch": "feat"},
+                {"repo": {"owner": "f", "name": "r"}, "branch": "owned", "pin": false}
+            ],
+            "output": {"repo": {"owner": "f", "name": "r"}, "branch": "main"}
+        }"#;
+        let cfg: SynthesisConfig = serde_json::from_str(json).expect("parse");
+        assert_eq!(cfg.patches.len(), 2);
+        assert!(cfg.patches[0].pin);
+        assert_eq!(cfg.patches[0].branch.branch, "feat");
+        assert!(!cfg.patches[1].pin);
+        // Flattened shape round-trips (no nested "branch" key).
+        let raw = serde_json::to_string(&cfg.patches[0]).expect("serialize");
+        assert!(raw.contains("\"branch\":\"feat\""), "got: {raw}");
+        assert!(!raw.contains("\"pin\""), "default pin omitted, got: {raw}");
     }
 }

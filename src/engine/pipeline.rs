@@ -22,7 +22,7 @@
 use anyhow::{Context, Result};
 use gix::{Repository, actor::SignatureRef};
 
-use crate::config::{BranchRef, Strategy};
+use crate::config::{BranchRef, PatchSpec, Strategy};
 use crate::engine::fetch::fetch_upstream;
 use crate::engine::push::push_output;
 use crate::engine::rebase::{ComposeOutcome, Merge, Overlay, Rebase};
@@ -117,7 +117,7 @@ fn ref_tree(repo: &Repository, r: &str) -> Option<gix::ObjectId> {
 pub fn synthesize(
     repo: &Repository,
     base: &BranchRef,
-    patches: &[BranchRef],
+    patches: &[PatchSpec],
     output: &BranchRef,
     strategy: Strategy,
     lock: &crate::lockfile::LockOptions,
@@ -129,7 +129,7 @@ pub fn synthesize(
         &base.branch,
         &patches
             .iter()
-            .map(|p| (p.clone(), p.repo.https_url()))
+            .map(|p| (p.clone(), p.branch.repo.https_url()))
             .collect::<Vec<_>>(),
         &output.repo.https_url(),
         &output.branch,
@@ -145,14 +145,15 @@ pub fn synthesize(
 /// [`crate::config::Repo::authed_https_url`]) before calling; `file://` and
 /// plain paths work unchanged for tests and local runs.
 ///
-/// Patches carry their [`BranchRef`] alongside the transport URL so resolved
-/// tips stay attributable for lockfile enforcement.
+/// Patches carry their [`PatchSpec`] alongside the transport URL so resolved
+/// tips stay attributable for lockfile enforcement. Unpinned specs compose
+/// identically — pinning only affects lockfile enforcement.
 #[allow(clippy::too_many_arguments)]
 pub fn synthesize_with_urls(
     repo: &Repository,
     base_url: &str,
     base_branch: &str,
-    patches: &[(BranchRef, String)],
+    patches: &[(PatchSpec, String)],
     output_url: &str,
     output_branch: &str,
     strategy: Strategy,
@@ -164,16 +165,19 @@ pub fn synthesize_with_urls(
     tracing::info!(base = %format!("{base_url}#{base_branch}"), tip = %base_tip, "fetched base");
     let mut patch_refs = Vec::with_capacity(patches.len());
     let mut resolved = Vec::with_capacity(patches.len());
-    for (i, (branch, url)) in patches.iter().enumerate() {
+    for (i, (spec, url)) in patches.iter().enumerate() {
         let local = format!("refs/synthesis/patch-{i}");
-        let oid = fetch_branch(repo, url, &branch.branch, &local)?;
-        tracing::info!(patch = %branch, tip = %oid, "fetched patch");
+        let oid = fetch_branch(repo, url, &spec.branch.branch, &local)?;
+        tracing::info!(patch = %spec.branch, tip = %oid, pinned = spec.pin, "fetched patch");
         patch_refs.push(local);
-        resolved.push((branch.clone(), oid));
+        if spec.pin {
+            resolved.push((spec.branch.clone(), oid));
+        }
     }
 
     // 1b. Pin patches: enforce (or bootstrap/update) the lockfile before
-    // anything composes or pushes.
+    // anything composes or pushes. Unpinned specs float by design and never
+    // reach enforcement.
     crate::lockfile::enforce(lock, &resolved)?;
 
     // 2. Compose the output from base + patches in order. Replay preserves
@@ -302,18 +306,33 @@ mod tests {
         dir.display().to_string()
     }
 
-    /// A patch source for tests: a BranchRef identity plus its transport URL.
-    fn patch_src(owner: &str, name: &str, url: String, branch: &str) -> (BranchRef, String) {
+    /// A patch source for tests: identity plus transport URL, pinned by
+    /// default; pass pin=false for first-party floaters.
+    fn patch_src(
+        owner: &str,
+        name: &str,
+        url: String,
+        branch: &str,
+        pin: bool,
+    ) -> (PatchSpec, String) {
         (
-            BranchRef {
-                repo: crate::config::Repo {
-                    owner: owner.into(),
-                    name: name.into(),
+            PatchSpec {
+                branch: BranchRef {
+                    repo: crate::config::Repo {
+                        owner: owner.into(),
+                        name: name.into(),
+                    },
+                    branch: branch.into(),
                 },
-                branch: branch.into(),
+                pin,
             },
             url,
         )
+    }
+
+    /// Pinned patch source (the common case).
+    fn pinned(owner: &str, name: &str, url: String, branch: &str) -> (PatchSpec, String) {
+        patch_src(owner, name, url, branch, true)
     }
 
     /// Locking disabled (legacy auto-follow) for tests not exercising pins.
@@ -356,7 +375,7 @@ mod tests {
             &scratch,
             &url(&upstream_dir),
             "main",
-            &[patch_src("other", "repo", url(&patch_dir), "feature")],
+            &[pinned("other", "repo", url(&patch_dir), "feature")],
             &url(&output_dir),
             "main",
             Strategy::Merge,
@@ -460,8 +479,8 @@ mod tests {
             &url(&upstream_dir),
             "main",
             &[
-                patch_src("a-org", "repo", url(&repo_a_dir), "a"),
-                patch_src("b-org", "repo", url(&repo_b_dir), "b"),
+                pinned("a-org", "repo", url(&repo_a_dir), "a"),
+                pinned("b-org", "repo", url(&repo_b_dir), "b"),
             ],
             &url(&output_dir),
             "main",
@@ -503,7 +522,7 @@ mod tests {
             &scratch,
             &url(&upstream_dir),
             "main",
-            &[patch_src("up", "repo", url(&upstream_dir), "nope")],
+            &[pinned("up", "repo", url(&upstream_dir), "nope")],
             &url(&output_dir),
             "main",
             Strategy::Overlay,
@@ -555,7 +574,7 @@ mod tests {
             &scratch,
             &url(&upstream_dir),
             "main",
-            &[patch_src("other", "repo", url(&patch_dir), "feature")],
+            &[pinned("other", "repo", url(&patch_dir), "feature")],
             &url(&output_dir),
             "main",
             Strategy::Merge,
@@ -634,8 +653,8 @@ mod tests {
             &url(&remote_dir),
             "main",
             &[
-                patch_src("sim", "repo", url(&remote_dir), "patch-a"),
-                patch_src("sim", "repo", url(&remote_dir), "patch-b"),
+                pinned("sim", "repo", url(&remote_dir), "patch-a"),
+                pinned("sim", "repo", url(&remote_dir), "patch-b"),
             ],
             &url(&output_dir),
             "main",
@@ -694,7 +713,7 @@ mod tests {
                 &scratch,
                 &url(&upstream_dir),
                 "main",
-                &[patch_src("rpatch", "repo", url(&patch_dir), "feature")],
+                &[pinned("rpatch", "repo", url(&patch_dir), "feature")],
                 &url(&output_dir),
                 "main",
                 Strategy::Replay,
@@ -759,7 +778,7 @@ mod tests {
                 &scratch,
                 &url(&upstream_dir),
                 "main",
-                &[patch_src("lp", "repo", url(&patch_dir), "feature")],
+                &[pinned("lp", "repo", url(&patch_dir), "feature")],
                 &url(&output_dir),
                 "main",
                 Strategy::Overlay,
@@ -813,5 +832,68 @@ mod tests {
         assert!(third.pushed, "new content pushes after re-lock");
         let raw = std::fs::read_to_string(&lock_path).expect("read lock");
         assert!(raw.contains(&p2.to_string()), "lock updated to new tip");
+    }
+
+    /// Unpinned patches float: they move freely, are never recorded, and
+    /// never fail enforcement.
+    #[test]
+    fn unpinned_patch_floats_outside_lockfile() {
+        use crate::lockfile::LockOptions;
+
+        let upstream_dir = temp_dir("uup");
+        let upstream = gix::init_bare(&upstream_dir).expect("init upstream");
+        let base = commit_with_files(&upstream, &[("a.txt", "a1")], "base", None);
+        set_ref(&upstream, "refs/heads/main", base);
+
+        let patch_dir = temp_dir("upatch");
+        let patch_repo = gix::init_bare(&patch_dir).expect("init patch repo");
+        let p1 = commit_with_files(&patch_repo, &[("a.txt", "a1"), ("f.txt", "f")], "p1", None);
+        set_ref(&patch_repo, "refs/heads/feature", p1);
+
+        let output_dir = temp_dir("uout");
+        let _output = gix::init_bare(&output_dir).expect("init output");
+
+        let lock_path = temp_dir("ulock").join("synthesis.lock");
+        let lock = LockOptions {
+            path: Some(lock_path.clone()),
+            update: false,
+        };
+        let run = |tag: &str| {
+            let scratch_dir = temp_dir(&format!("uscratch-{tag}"));
+            let scratch = gix::init_bare(&scratch_dir).expect("init scratch");
+            synthesize_with_urls(
+                &scratch,
+                &url(&upstream_dir),
+                "main",
+                &[patch_src("up", "repo", url(&patch_dir), "feature", false)],
+                &url(&output_dir),
+                "main",
+                Strategy::Overlay,
+                &lock,
+                sig(),
+            )
+            .expect("synthesize")
+        };
+
+        let first = run("a");
+        assert!(first.pushed);
+        // Lockfile bootstrapped but records nothing: the only patch floats.
+        let raw = std::fs::read_to_string(&lock_path).expect("read lock");
+        assert!(!raw.contains(&p1.to_string()), "unpinned tip not recorded");
+
+        // Advance the floating branch: still passes, new content flows.
+        let p2 = commit_with_files(
+            &patch_repo,
+            &[("a.txt", "a1"), ("f.txt", "f2")],
+            "p2",
+            Some(p1),
+        );
+        set_ref(&patch_repo, "refs/heads/feature", p2);
+        let second = run("b");
+        assert!(second.pushed, "floating patch moves freely");
+        assert_ne!(
+            second.tree, first.tree,
+            "new patch content flows into the output"
+        );
     }
 }
