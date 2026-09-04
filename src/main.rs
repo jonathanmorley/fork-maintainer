@@ -20,7 +20,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use fork_maintainer::config::{BranchRef, Strategy, SynthesisConfig};
+use fork_maintainer::config::{BranchRef, PatchSpec, Strategy, SynthesisConfig};
 use fork_maintainer::engine::pipeline::synthesize_with_urls;
 use gix::actor::SignatureRef;
 
@@ -146,7 +146,10 @@ fn load_config(args: &Args) -> Result<SynthesisConfig> {
         cfg.patches = args
             .patches
             .iter()
-            .map(|p| BranchRef::parse_compact(p))
+            .map(|p| {
+                let branch = BranchRef::parse_compact(p)?;
+                Ok::<_, anyhow::Error>(PatchSpec { branch, pin: true })
+            })
             .collect::<Result<Vec<_>>>()?;
     }
     if let Some(output) = &args.output {
@@ -271,7 +274,7 @@ fn main() -> Result<()> {
         &cfg.base.branch,
         &cfg.patches
             .iter()
-            .map(|p| (p.clone(), with_auth(&p.repo.https_url())))
+            .map(|p| (p.clone(), with_auth(&p.branch.repo.https_url())))
             .collect::<Vec<_>>(),
         &with_auth(&cfg.output.repo.https_url()),
         &cfg.output.branch,
@@ -384,6 +387,7 @@ mod tests {
         let cfg = load_config(&a).expect("flags");
         assert_eq!(cfg.base.compact(), "up/repo@main");
         assert_eq!(cfg.patches.len(), 2);
+        assert!(cfg.patches.iter().all(|p| p.pin), "flags pin by default");
         assert_eq!(cfg.output.compact(), "me/repo@main");
         assert_eq!(cfg.strategy, Strategy::Overlay);
     }
@@ -410,7 +414,7 @@ mod tests {
         let cfg = load_config(&a).expect("file+flags");
         // Flags replace patches; file's base/output/strategy survive.
         assert_eq!(cfg.patches.len(), 1);
-        assert_eq!(cfg.patches[0].compact(), "f/r@new");
+        assert_eq!(cfg.patches[0].branch.compact(), "f/r@new");
         assert_eq!(cfg.strategy, Strategy::Overlay);
     }
 }

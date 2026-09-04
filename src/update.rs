@@ -35,6 +35,8 @@ pub struct PrSummary {
 pub struct PatchStatus {
     /// The declared patch.
     pub patch: BranchRef,
+    /// Whether the patch is pinned (lockfile-enforced).
+    pub pin: bool,
     /// Current branch tip, or `None` when the branch no longer exists.
     pub tip: Option<gix::ObjectId>,
     /// Associated PRs (by head branch, in the patch's repo and the output
@@ -86,6 +88,11 @@ pub fn plan_updates(statuses: &[PatchStatus], lock: Option<&Lockfile>) -> Result
                 "patch {} no longer exists and has no merged PR; refusing to guess — investigate manually",
                 status.patch
             );
+        };
+        // Unpinned patches float by design: nothing to record, nothing to
+        // compare. Their movement is expected, not drift.
+        if !status.pin {
+            continue;
         };
         let locked = lock.and_then(|l| {
             l.patches.iter().find_map(|p| {
@@ -236,12 +243,13 @@ fn next_link(headers: &reqwest::header::HeaderMap) -> Option<String> {
 /// Returns an error when any transport or API call fails.
 pub fn observe_patches(
     github: &GitHub,
-    patches: &[BranchRef],
+    patches: &[crate::config::PatchSpec],
     output: &BranchRef,
     url_for: &dyn Fn(&crate::config::Repo) -> String,
 ) -> Result<Vec<PatchStatus>> {
     let mut out = Vec::with_capacity(patches.len());
-    for patch in patches {
+    for spec in patches {
+        let patch = &spec.branch;
         let tip = resolve_tip(&url_for(&patch.repo), &patch.branch)?;
         let mut prs = github.prs_for_head(&patch.repo, &patch.branch)?;
         if patch.repo.slug() != output.repo.slug() {
@@ -251,6 +259,7 @@ pub fn observe_patches(
         tracing::info!(patch = %patch, tip = ?tip.map(|t| t.to_string()), prs = prs.len(), "observed patch");
         out.push(PatchStatus {
             patch: patch.clone(),
+            pin: spec.pin,
             tip,
             prs,
         });
@@ -276,13 +285,16 @@ pub fn apply_to_files(
 ) -> Result<()> {
     let mut cfg = cfg.clone();
     for (removed, pr_number) in &plan.removed {
-        cfg.patches
-            .retain(|p| p.repo.slug() != removed.repo.slug() || p.branch != removed.branch);
+        cfg.patches.retain(|p| {
+            p.branch.repo.slug() != removed.repo.slug() || p.branch.branch != removed.branch
+        });
         tracing::info!(patch = %removed, pr = pr_number, "proposing patch removal (PR merged)");
     }
-    // Lock covers surviving patches only (removed ones drop out by rewrite).
+    // Lock covers pinned surviving patches only: removed ones drop out by
+    // rewrite, unpinned ones were never recorded.
     let surviving: Vec<(BranchRef, gix::ObjectId)> = statuses
         .iter()
+        .filter(|s| s.pin)
         .filter(|s| {
             !plan
                 .removed
@@ -336,6 +348,22 @@ mod tests {
     ) -> PatchStatus {
         PatchStatus {
             patch: bref(owner, name, branch),
+            pin: true,
+            tip,
+            prs,
+        }
+    }
+
+    fn floating(
+        owner: &str,
+        name: &str,
+        branch: &str,
+        tip: Option<gix::ObjectId>,
+        prs: Vec<PrSummary>,
+    ) -> PatchStatus {
+        PatchStatus {
+            patch: bref(owner, name, branch),
+            pin: false,
             tip,
             prs,
         }
@@ -343,6 +371,13 @@ mod tests {
 
     fn pr(number: u64, merged: bool) -> PrSummary {
         PrSummary { number, merged }
+    }
+
+    fn pspec(owner: &str, name: &str, branch: &str) -> crate::config::PatchSpec {
+        crate::config::PatchSpec {
+            branch: bref(owner, name, branch),
+            pin: true,
+        }
     }
 
     #[test]
@@ -396,6 +431,19 @@ mod tests {
         assert!(plan.lock_changed);
     }
 
+    #[test]
+    fn unpinned_patch_ignored_for_lock_but_not_removal() {
+        // A moved floating branch is expected movement, not drift.
+        let statuses = vec![floating("o", "r", "own", Some(oid(2)), vec![])];
+        let lock = Lockfile::from_resolved(&[(bref("o", "r", "own"), oid(1))]);
+        let plan = plan_updates(&statuses, Some(&lock)).expect("plan");
+        assert!(plan.is_empty());
+        // ...but a merged PR still proposes removal, pinned or not.
+        let statuses = vec![floating("o", "r", "own", Some(oid(2)), vec![pr(11, true)])];
+        let plan = plan_updates(&statuses, Some(&lock)).expect("plan");
+        assert_eq!(plan.removed.len(), 1);
+    }
+
     /// resolve_tip works offline against local bare repos (git CLI).
     #[test]
     fn resolve_tip_reads_local_branches() {
@@ -436,7 +484,7 @@ mod tests {
 
         let cfg = SynthesisConfig {
             base: bref("up", "r", "main"),
-            patches: vec![bref("o", "r", "gone"), bref("o", "r", "kept")],
+            patches: vec![pspec("o", "r", "gone"), pspec("o", "r", "kept")],
             output: bref("o", "r", "main"),
             strategy: crate::config::Strategy::Merge,
         };
@@ -453,7 +501,7 @@ mod tests {
         let back: SynthesisConfig =
             serde_json::from_str(&std::fs::read_to_string(&config_path).expect("read"))
                 .expect("parse");
-        assert_eq!(back.patches, vec![bref("o", "r", "kept")]);
+        assert_eq!(back.patches, vec![pspec("o", "r", "kept")]);
         let lock: Lockfile =
             serde_json::from_str(&std::fs::read_to_string(&lock_path).expect("read"))
                 .expect("parse");
@@ -473,7 +521,7 @@ mod tests {
         let lock_path = dir.join("synthesis.lock");
         let cfg = SynthesisConfig {
             base: bref("up", "r", "main"),
-            patches: vec![bref("o", "r", "gone")],
+            patches: vec![pspec("o", "r", "gone")],
             output: bref("o", "r", "main"),
             strategy: crate::config::Strategy::Merge,
         };

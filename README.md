@@ -101,6 +101,19 @@ pinned); `--update-lock` re-resolves and rewrites — commit the result for
 review. The lockfile must be committed, or ephemeral runners degrade to
 perpetual bootstrap. Action inputs: `lockfile`, `update-lock`.
 
+### First-party branches float
+
+Patches are pinned by default, but a branch you push yourself — typically a
+`fork-owned` overlay carrying the caller workflows, config, and lockfile —
+declares `"pin": false` (config-file only; `--patch` flags always pin).
+Nothing technical distinguishes first from third party; the flag is a
+conscious, auditable trust assertion, and pinning defaults to distrust.
+Floating is also structural, not just philosophical: managed files change
+through the maintenance loop itself, so pinning their carrier branch would
+deadlock on its own SHAs. Unpinned patches compose identically, move
+freely, are never recorded — but a vanished unpinned branch still fails
+closed, and merged-PR removal still applies.
+
 ## Update workflow
 
 `--update` (via `synthesize update`, or the `update.yml` reusable workflow)
