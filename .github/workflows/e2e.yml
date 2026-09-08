@@ -1,0 +1,95 @@
+# End-to-end validation against the gh-testbed repo.
+#
+# Runs only when packaging changes (the action, its workflows, or the engine
+# it builds) — Rust-only logic is covered by unit tests, while arg plumbing,
+# inputs wiring, and runner behavior can only be proven live. The testbed
+# caller is temporarily re-pinned to the PR head SHA, the validation run is
+# dispatched and awaited, then the pin is restored to main no matter what.
+#
+# Authentication uses Octo STS, not a stored PAT: the job mints a
+# short-lived token scoped to the testbed repo (trust policy at
+# .github/chainguard/provider-synth-e2e.sts.yaml there). No long-lived
+# credentials to rotate or leak.
+# Concurrent PRs serialize on the concurrency group so two runs never fight
+# over the shared testbed pin.
+
+name: E2E (testbed)
+
+on:
+  pull_request:
+    paths:
+      - "action.yml"
+      - ".github/workflows/**"
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+
+concurrency:
+  group: e2e-testbed
+  cancel-in-progress: false
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      id-token: write
+    steps:
+      - name: Mint testbed token via Octo STS
+        id: sts
+        uses: octo-sts/action@f603d3be9d8dd9871a265776e625a27b00effe05  # v1.1.1
+        with:
+          scope: jonathanmorley/gh-testbed
+          identity: provider-synth-e2e
+
+      - name: Re-pin testbed to PR head
+        env:
+          GH_TOKEN: ${{ steps.sts.outputs.token }}
+        run: |
+          set -euo pipefail
+          SHA=$(gh api repos/jonathanmorley/gh-testbed/contents/.github/workflows/resolve-validation.yml --jq '.sha')
+          gh api repos/jonathanmorley/gh-testbed/contents/.github/workflows/resolve-validation.yml --jq '.content' \
+            | base64 -d \
+            | sed -E "s|jonathanmorley/fork-maintainer@[0-9a-f]{40}|jonathanmorley/fork-maintainer@${{ github.sha }}|" \
+            > caller.yml
+          grep -q "fork-maintainer@${{ github.sha }}" caller.yml
+          CONTENT=$(base64 -w0 < caller.yml)
+          gh api repos/jonathanmorley/gh-testbed/contents/.github/workflows/resolve-validation.yml \
+            -X PUT -f message="testbed: validate ${{ github.sha }}" -f content="$CONTENT" -f sha="$SHA" \
+            --jq '{commit: .commit.sha[:8]}'
+
+      - name: Dispatch validation run
+        id: dispatch
+        env:
+          GH_TOKEN: ${{ steps.sts.outputs.token }}
+        run: |
+          set -euo pipefail
+          sleep 20  # let GitHub index the updated workflow file
+          URL=$(gh workflow run resolve-validation.yml --repo jonathanmorley/gh-testbed --ref main 2>&1 | tail -1)
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          echo "run_id=$(basename "$URL")" >> "$GITHUB_OUTPUT"
+
+      - name: Await verdict
+        env:
+          GH_TOKEN: ${{ steps.sts.outputs.token }}
+        run: |
+          timeout 1200 gh run watch "${{ steps.dispatch.outputs.run_id }}" \
+            --repo jonathanmorley/gh-testbed --exit-status
+
+      - name: Restore pin to main
+        if: always()
+        env:
+          GH_TOKEN: ${{ steps.sts.outputs.token }}
+        run: |
+          set -euo pipefail
+          MAIN_SHA=$(git ls-remote https://github.com/jonathanmorley/fork-maintainer.git refs/heads/main | awk '{print $1}')
+          SHA=$(gh api repos/jonathanmorley/gh-testbed/contents/.github/workflows/resolve-validation.yml --jq '.sha')
+          gh api repos/jonathanmorley/gh-testbed/contents/.github/workflows/resolve-validation.yml --jq '.content' \
+            | base64 -d \
+            | sed -E "s|jonathanmorley/fork-maintainer@[0-9a-f]{40}|jonathanmorley/fork-maintainer@${MAIN_SHA}|" \
+            > caller.yml
+          grep -q "fork-maintainer@${MAIN_SHA}" caller.yml
+          CONTENT=$(base64 -w0 < caller.yml)
+          gh api repos/jonathanmorley/gh-testbed/contents/.github/workflows/resolve-validation.yml \
+            -X PUT -f message="testbed: restore pin to main" -f content="$CONTENT" -f sha="$SHA" \
+            --jq '{commit: .commit.sha[:8]}'
