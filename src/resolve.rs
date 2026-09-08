@@ -6,6 +6,13 @@
 //! `ancestor/`, `ours/`, `theirs/` file sets plus a `TASK.md`, and the agent
 //! is invoked non-interactively to write merged results into `resolved/`.
 //!
+//! The scratch directory lives under the caller's working directory
+//! (`.synthesize-resolve-<pid>-<nanos>`, removed on success): agents gate
+//! off-project paths behind an external-directory permission that
+//! auto-rejects non-interactively, while in-workspace paths work under
+//! default policy. Absolute paths are used throughout regardless, since
+//! agent servers may resolve relative paths against their own directory.
+//!
 //! Rules that keep this honest:
 //! - Binary (non-UTF-8) paths fail without invoking the agent.
 //! - A missing `resolved/` file for any conflicted path fails the run.
@@ -137,8 +144,14 @@ pub fn resolve_with_agent(
 
     // Materialize the scratch dir. Tree locations never contain `..`
     // (rejected by git), but guard anyway: nothing escapes the scratch dir.
-    let scratch = std::env::temp_dir().join(format!(
-        "resolve-{}-{}",
+    // Scratch lives under the caller's working directory, not the system
+    // temp dir: agents gate off-project paths behind an external-directory
+    // permission that auto-rejects non-interactively, while in-workspace
+    // paths work under default policy. Unique hidden name; removed on
+    // success, kept (and reported) on failure for manual resolution.
+    let scratch_root = std::env::current_dir().context("resolve working directory")?;
+    let scratch = scratch_root.join(format!(
+        ".synthesize-resolve-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -165,8 +178,10 @@ pub fn resolve_with_agent(
             }
         }
     }
+    let task_path = scratch.join("TASK.md");
     let mut task = format!(
-        "# Merge conflicts for `{layer}`\n\nFor each path below, merge the `ours/` and `theirs/` versions honoring `ancestor/` as the common base, and write the result to `resolved/<path>`. A side marked absent does not exist on that side (treat a missing ancestor as a file both sides added). Every listed path needs a `resolved/` file or the run fails. Do not touch anything else.\n"
+        "# Merge conflicts for `{layer}`\n\nWorking directory for all paths below: `{}`\n\nFor each listed path, merge the `ours/` and `theirs/` versions honoring `ancestor/` as the common base, and write the result to `resolved/<path>`. Write the final merged content directly — never emit conflict markers (`<<<<<<<`, `=======`, `>>>>>>>`); a file containing markers is rejected and fails the run. A side marked absent does not exist on that side (treat a missing ancestor as a file both sides added). Every listed path needs a `resolved/` file or the run fails. Do not touch anything else.\n",
+        scratch.display(),
     );
     for m in &materialized {
         let _ = writeln!(
@@ -193,13 +208,19 @@ pub fn resolve_with_agent(
     )
     .with_context(|| format!("write {}", scratch.join("PATHS").display()))?;
 
-    // Invoke the agent with a short prompt; the files carry the content.
+    // Invoke the agent with absolute paths throughout: agent servers may
+    // resolve relative paths against their own working directory instead of
+    // the child's, which silently points them elsewhere. Absolute paths are
+    // robust to either behavior.
     let mut cmd = std::process::Command::new(&cfg.program);
     cmd.arg("run").current_dir(&scratch);
     if let Some(model) = &cfg.model {
         cmd.arg("--model").arg(model);
     }
-    cmd.arg("Follow TASK.md in the current directory.");
+    cmd.arg(format!(
+        "Follow the merge instructions in {}.",
+        task_path.display()
+    ));
     tracing::info!(program = %cfg.program, scratch = %scratch.display(), "invoking agent");
     let output = cmd.output().with_context(|| {
         format!(
@@ -214,22 +235,31 @@ pub fn resolve_with_agent(
     );
     if !output.status.success() {
         anyhow::bail!(
-            "agent `{}` failed; resolve manually — nothing was pushed",
-            cfg.program
+            "agent `{}` failed (scratch kept at {}); resolve manually — nothing was pushed",
+            cfg.program,
+            scratch.display()
         );
     }
 
-    // Read every resolved file back, then drop the handled entries so the
-    // outcome no longer reports them.
+    // Read every resolved file back, rejecting conflict markers (an agent
+    // punting markers into the file is not a resolution), then drop the
+    // handled entries so the outcome no longer reports them.
     let mut handled = Vec::with_capacity(materialized.len());
     for m in &materialized {
         let path = scratch.join("resolved").join(&m.path);
         let bytes = std::fs::read(&path).with_context(|| {
             format!(
-                "agent did not write resolved file {}; resolve manually",
-                path.display()
+                "agent did not write resolved file {} (scratch kept at {}); resolve manually",
+                path.display(),
+                scratch.display()
             )
         })?;
+        if let Some(marker) = conflict_marker(&bytes) {
+            anyhow::bail!(
+                "agent emitted conflict markers ({marker}) in {}; resolve manually — nothing was pushed",
+                path.display()
+            );
+        }
         let blob = repo.write_blob(&bytes).context("write resolved blob")?;
         outcome
             .tree
@@ -239,6 +269,8 @@ pub fn resolve_with_agent(
     outcome
         .conflicts
         .retain(|c| !handled.contains(&c.ours.location().to_string()));
+    // Success: tidy the scratch dir (best effort); failures keep it above.
+    let _ = std::fs::remove_dir_all(&scratch);
     Ok(())
 }
 
@@ -250,9 +282,57 @@ fn presence(content: &Option<Vec<u8>>) -> &'static str {
     }
 }
 
+/// Detect git conflict markers in resolved content: a line starting with at
+/// least seven `<` (ours), exactly seven `=` (separator), or at least seven
+/// `>` (theirs). Returns the offending marker kind for error messages.
+fn conflict_marker(content: &[u8]) -> Option<&'static str> {
+    let text = String::from_utf8_lossy(content);
+    for line in text.lines() {
+        if line.starts_with("<<<<<<<") {
+            return Some("<<<<<<<");
+        }
+        if line == "=======" {
+            return Some("=======");
+        }
+        if line.starts_with(">>>>>>>") {
+            return Some(">>>>>>>");
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serializes resolve tests (they share the process cwd for scratch)
+    /// and removes any scratch dirs they leave behind, panic or not.
+    static SCRATCH_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct ScratchGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl ScratchGuard {
+        fn take() -> Self {
+            let lock = SCRATCH_GUARD.lock().expect("test lock");
+            Self { _lock: lock }
+        }
+    }
+
+    impl Drop for ScratchGuard {
+        fn drop(&mut self) {
+            let Ok(entries) = std::fs::read_dir(".") else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with(".synthesize-resolve-") {
+                    let _ = std::fs::remove_dir_all(entry.path());
+                }
+            }
+        }
+    }
 
     const AGENT_SH: &str = r#"#!/bin/sh
 # Mock agent: resolves every path in PATHS by copying theirs/ (or ours/
@@ -356,6 +436,7 @@ done < PATHS
 
     #[test]
     fn agent_resolution_lands_in_tree() {
+        let _guard = ScratchGuard::take();
         let dir = std::env::temp_dir().join(format!("resolve-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("mkdir");
@@ -396,6 +477,7 @@ done < PATHS
 
     #[test]
     fn agent_failure_fails_closed() {
+        let _guard = ScratchGuard::take();
         let dir = std::env::temp_dir().join(format!("resolve-fail-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("mkdir");
@@ -417,6 +499,7 @@ done < PATHS
 
     #[test]
     fn missing_resolved_file_fails() {
+        let _guard = ScratchGuard::take();
         let dir = std::env::temp_dir().join(format!("resolve-miss-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("mkdir");
@@ -442,6 +525,7 @@ done < PATHS
 
     #[test]
     fn no_conflicts_never_invokes_agent() {
+        let _guard = ScratchGuard::take();
         let dir = std::env::temp_dir().join(format!("resolve-idle-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("mkdir");
@@ -472,6 +556,7 @@ done < PATHS
 
     #[test]
     fn binary_conflict_never_invokes_agent() {
+        let _guard = ScratchGuard::take();
         let dir = std::env::temp_dir().join(format!("resolve-bin-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("mkdir");
@@ -546,5 +631,53 @@ done < PATHS
             "binary must fail as non-text, got: {err}"
         );
         assert!(!sentinel.exists(), "agent must not run for binary");
+    }
+
+    #[test]
+    fn marker_output_rejected() {
+        let dir = std::env::temp_dir().join(format!("resolve-mark-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let repo = gix::init_bare(dir.join("repo")).expect("init bare");
+        // Mock agent that punts conflict markers into the resolved file.
+        let script = dir.join("marker-agent.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nset -eu\nmkdir -p resolved\nprintf 'a\\n<<<<<<< ours\\nA\\n=======\\nB\\n>>>>>>> theirs\\nb\\n' > resolved/a.txt\n",
+        )
+        .expect("write mock");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script).expect("meta").permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).expect("chmod");
+        }
+        let _guard = ScratchGuard::take();
+        let cfg = ResolveConfig {
+            program: script.display().to_string(),
+            model: None,
+        };
+        let mut outcome = conflicting_outcome(&repo);
+        let paths: Vec<String> = outcome
+            .conflicts
+            .iter()
+            .map(|c| c.ours.location().to_string())
+            .collect();
+        let err = resolve_with_agent(&repo, &mut outcome, "test-layer", &paths, &cfg)
+            .expect_err("markers must fail");
+        assert!(
+            err.to_string().contains("conflict markers"),
+            "markers must fail as markers, got: {err}"
+        );
+    }
+
+    #[test]
+    fn marker_detection_unit() {
+        assert_eq!(conflict_marker(b"a\n<<<<<<< ours\n"), Some("<<<<<<<"));
+        assert_eq!(conflict_marker(b"a\n=======\n"), Some("======="));
+        assert_eq!(conflict_marker(b"a\n>>>>>>> theirs\n"), Some(">>>>>>>"));
+        assert_eq!(conflict_marker(b"a ========= b\n"), None);
+        assert_eq!(conflict_marker(b"plain content\n"), None);
     }
 }

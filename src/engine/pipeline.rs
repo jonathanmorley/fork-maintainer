@@ -80,7 +80,12 @@ fn fetch_branch(
     local_ref: &str,
 ) -> Result<gix::ObjectId> {
     fetch_upstream(repo, url, branch, local_ref)
-        .with_context(|| format!("fetch branch `{branch}` from `{url}`"))
+        .with_context(|| {
+            format!(
+                "fetch branch `{branch}` from `{}`",
+                crate::engine::redact_url(url)
+            )
+        })
         .map(|tip| tip.oid)
 }
 
@@ -97,7 +102,12 @@ fn fetch_prev_output(repo: &Repository, url: &str, branch: &str) -> Result<Optio
             if msg.contains("did not advertise") || msg.contains(&format!("refs/heads/{branch}")) {
                 Ok(None)
             } else {
-                Err(e).with_context(|| format!("fetch output branch `{branch}` from `{url}`"))
+                Err(e).with_context(|| {
+                    format!(
+                        "fetch output branch `{branch}` from `{}`",
+                        crate::engine::redact_url(url)
+                    )
+                })
             }
         }
     }
@@ -170,7 +180,11 @@ pub fn synthesize_with_urls(
 ) -> Result<SynthesizeOutcome> {
     // 1. Fetch the base and every patch branch into local refs.
     let base_tip = fetch_branch(repo, base_url, base_branch, BASE_REF)?;
-    tracing::info!(base = %format!("{base_url}#{base_branch}"), tip = %base_tip, "fetched base");
+    tracing::info!(
+        base = %format!("{}#{}", crate::engine::redact_url(base_url), base_branch),
+        tip = %base_tip,
+        "fetched base"
+    );
     let mut patch_refs = Vec::with_capacity(patches.len());
     let mut resolved = Vec::with_capacity(patches.len());
     for (i, (spec, url)) in patches.iter().enumerate() {
@@ -212,7 +226,8 @@ pub fn synthesize_with_urls(
             )
             .with_context(|| {
                 format!(
-                    "replay {} patch(es) onto {base_branch} from {base_url}",
+                    "replay {} patch(es) onto {base_branch} from {}",
+                    crate::engine::redact_url(base_url),
                     patches.len()
                 )
             })?;
@@ -233,7 +248,8 @@ pub fn synthesize_with_urls(
                 .compose(repo, BASE_REF, &patch_refs, OUTPUT_REF, committer)
                 .with_context(|| {
                     format!(
-                        "compose {} patch(es) onto {base_branch} from {base_url}",
+                        "compose {} patch(es) onto {base_branch} from {}",
+                        crate::engine::redact_url(base_url),
                         patches.len()
                     )
                 })?;

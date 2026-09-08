@@ -87,7 +87,10 @@ pub fn push_refs(
     let output = cmd.output().context("failed to execute git push")?;
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        // git echoes the remote URL (credentials included) in failures;
+        // scrub it before it can reach logs.
+        let stderr = String::from_utf8_lossy(&output.stderr)
+            .replace(remote_url, &crate::engine::redact_url(remote_url));
         anyhow::bail!("git push failed: {stderr}");
     }
 

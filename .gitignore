@@ -1,2 +1,4 @@
 /target
 .worktrees/
+# local runs bootstrap this; never commit tool output
+synthesis.lock
