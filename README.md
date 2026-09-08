@@ -123,6 +123,23 @@ dropping patches whose PRs merged — for human review. It never pushes
 output, deletes branches, or closes PRs; synthesis itself stays read-only
 on inputs. A branch that vanished without a merged PR fails closed.
 
+## Adoption (`init`)
+
+`synthesize --init` scaffolds a fork for managed synthesis. Given `--upstream`
+(`owner/name@branch`) and `--fork` (`owner/name`), run inside a checkout of
+the fork, it discovers open PRs with heads in the fork as patch proposals,
+creates the control branch (from the upstream tip, or a fresh root with
+`--fresh`), and writes the caller workflows plus `synthesis.json` into it —
+committed locally, never pushed unless `--push` is set.
+
+The generated config leads with the control branch itself, unpinned, so its
+files reach the output; discovered patches follow pinned. No lockfile is
+written: the first synthesis bootstraps it, and reviewing those SHAs is
+load-bearing. Afterwards it prints the cutover sequence (backup tag, push,
+flip the default branch in settings, trigger the first run, review the
+lock). Destructive steps stay human by design — including the default-branch
+flip, which no CLI can perform.
+
 The update workflow opens a PR with the rewritten config + lockfile on a
 schedule (weekly is a good default) and on `workflow_dispatch` (with a
 `dry-run` input for previews). Merge the proposal and the next synthesis

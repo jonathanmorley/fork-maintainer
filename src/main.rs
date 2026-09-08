@@ -70,6 +70,34 @@ struct Args {
     /// Preview file writes without executing them (with --update).
     #[arg(long)]
     dry_run: bool,
+    /// Scaffold a managed fork: create the control branch locally with
+    /// caller workflows + config. Never pushes unless --push is set.
+    #[arg(long)]
+    init: bool,
+    /// Upstream base as `owner/name@branch` (with --init).
+    #[arg(long)]
+    upstream: Option<String>,
+    /// Fork under adoption as `owner/name` (with --init).
+    #[arg(long)]
+    fork: Option<String>,
+    /// Output branch name in the fork (with --init). Defaults to `main`.
+    #[arg(long)]
+    output_branch: Option<String>,
+    /// Control branch to create (with --init). Defaults to `fork-owned`.
+    #[arg(long)]
+    branch: Option<String>,
+    /// Fresh root commit for the control branch instead of forking the
+    /// upstream tip (with --init).
+    #[arg(long)]
+    fresh: bool,
+    /// Push the created control branch (with --init). Default prints the
+    /// push command instead.
+    #[arg(long)]
+    push: bool,
+    /// Engine ref to pin in generated caller workflows (with --init).
+    /// Defaults to resolving fork-maintainer main at runtime.
+    #[arg(long)]
+    engine_ref: Option<String>,
 }
 
 /// Committer identity stamped on synthesized commits; the timestamp is the
@@ -220,6 +248,97 @@ fn run_update(args: &Args) -> Result<()> {
     Ok(())
 }
 
+/// Scaffold a managed fork (see [`fork_maintainer::init`]).
+///
+/// Resolves the engine pin, discovers open PRs, and delegates filesystem
+/// work to [`fork_maintainer::init::scaffold`]. Prints the human cutover
+/// sequence afterwards.
+fn run_init(args: &Args) -> Result<()> {
+    use fork_maintainer::init as scaffolding;
+
+    let upstream = BranchRef::parse_compact(
+        args.upstream
+            .as_deref()
+            .context("--upstream is required with --init")?,
+    )?;
+    let fork = args
+        .fork
+        .as_deref()
+        .context("--fork is required with --init (owner/name)")?;
+    let (owner, name) = fork.split_once('/').context("--fork must be owner/name")?;
+    if owner.is_empty() || name.is_empty() {
+        anyhow::bail!("--fork must be owner/name, got `{fork}`");
+    }
+    let fork = fork_maintainer::config::Repo {
+        owner: owner.to_string(),
+        name: name.to_string(),
+    };
+    let workdir = args
+        .workdir
+        .clone()
+        .unwrap_or_else(scaffolding::default_workdir);
+    if !workdir.join(".git").exists() {
+        anyhow::bail!(
+            "--workdir {} is not a git checkout of the fork",
+            workdir.display()
+        );
+    }
+
+    let token = resolve_token(args.token.clone());
+    let with_auth = |url: &str| authed_url(url, token.as_deref());
+    let url_for = |repo: &fork_maintainer::config::Repo| with_auth(&repo.https_url());
+
+    // Engine pin: explicit flag, else live upstream tip, else branch name.
+    let engine_pin = match &args.engine_ref {
+        Some(r) => r.clone(),
+        None => match fork_maintainer::update::resolve_tip(
+            "https://github.com/jonathanmorley/fork-maintainer.git",
+            "main",
+        ) {
+            Ok(Some(sha)) => sha.to_string(),
+            _ => {
+                tracing::warn!("could not resolve engine pin; using branch name");
+                "main".to_string()
+            }
+        },
+    };
+
+    let github = scaffolding_github(token.clone())?;
+    let open = github.open_prs(&fork)?;
+    let opts = scaffolding::InitOptions {
+        base: upstream,
+        fork: fork.clone(),
+        output_branch: args
+            .output_branch
+            .clone()
+            .unwrap_or_else(|| "main".to_string()),
+        control_branch: args
+            .branch
+            .clone()
+            .unwrap_or_else(|| "fork-owned".to_string()),
+        fresh: args.fresh,
+        engine_ref: engine_pin,
+    };
+    let report = scaffolding::scaffold(&workdir, &opts, &open, &url_for, args.push)?;
+    println!(
+        "init: created branch {} with {} files ({} patch proposals{})",
+        report.branch,
+        report.files.len(),
+        report.patches.len(),
+        if args.push { ", pushed" } else { "" },
+    );
+    println!("{}", report.next_steps(&fork));
+    Ok(())
+}
+
+fn scaffolding_github(token: Option<String>) -> Result<fork_maintainer::update::GitHub> {
+    let mut github = fork_maintainer::update::GitHub::new("fork-maintainer/synthesize-init")?;
+    if let Some(t) = token {
+        github = github.with_token(t);
+    }
+    Ok(github)
+}
+
 fn scratch_dir(workdir: Option<PathBuf>) -> Result<PathBuf> {
     let dir = match workdir {
         Some(dir) => dir,
@@ -243,6 +362,10 @@ fn main() -> Result<()> {
 
     if args.update {
         return run_update(&args);
+    }
+
+    if args.init {
+        return run_init(&args);
     }
 
     let cfg = load_config(&args)?;
@@ -315,6 +438,14 @@ mod tests {
             update_lock: false,
             update: false,
             dry_run: false,
+            init: false,
+            upstream: None,
+            fork: None,
+            output_branch: None,
+            branch: None,
+            fresh: false,
+            push: false,
+            engine_ref: None,
         }
     }
 
