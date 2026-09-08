@@ -116,7 +116,12 @@ impl Rebase for Overlay {
 ///
 /// This is a stepping stone toward full cascade-rebase: it provides
 /// conflict detection without the linear-history rebase semantics.
-pub struct Merge;
+#[derive(Debug, Clone, Default)]
+pub struct Merge {
+    /// Optional agent resolver for unresolved layers. `None` (the default)
+    /// fails closed on the first unresolved conflict.
+    pub resolve: Option<crate::resolve::ResolveConfig>,
+}
 
 impl Rebase for Merge {
     fn compose(
@@ -131,6 +136,7 @@ impl Rebase for Merge {
         let base_oid = repo.find_reference(base_ref)?.id().detach();
         let base_commit = repo.find_commit(base_oid)?;
         let mut running_tree = base_commit.tree_id()?.detach();
+        let mut agent_used = false;
 
         for branch in branches {
             let branch_oid = repo.find_reference(branch)?.id().detach();
@@ -163,10 +169,12 @@ impl Rebase for Merge {
                 .merge_trees(ancestor_tree, running_tree, branch_tree, labels, options)
                 .with_context(|| format!("3-way merge for branch `{branch}`"))?;
 
-            // Judge conflicts the way git would (shared helper: identical
-            // additions are agreed content, the rest must be unresolvable
-            // to fail the run).
-            settle_conflicts(&mut outcome, branch)?;
+            // Judge conflicts the way git would, resolving via agent when
+            // configured (shared helper records whether it ran).
+            if crate::resolve::settle_or_resolve(&mut outcome, branch, repo, self.resolve.as_ref())?
+            {
+                agent_used = true;
+            }
 
             // Write the merged tree and advance the running tree.
             let merged_tree_id = outcome.tree.write()?.detach();
@@ -174,17 +182,21 @@ impl Rebase for Merge {
         }
 
         // Create the commit and advance target_ref.
+        let mut message = format!(
+            "Recompose artifact from {} stack branches (merge strategy)",
+            branches.len()
+        );
+        if agent_used {
+            message.push_str(&format!(
+                "\n\nResolved-by: {}",
+                self.resolve
+                    .as_ref()
+                    .map(|r| r.program.clone())
+                    .unwrap_or_default()
+            ));
+        }
         let commit = repo
-            .new_commit_as(
-                committer,
-                committer,
-                format!(
-                    "Recompose artifact from {} stack branches (merge strategy)",
-                    branches.len()
-                ),
-                running_tree,
-                [base_oid],
-            )?
+            .new_commit_as(committer, committer, message, running_tree, [base_oid])?
             .id;
 
         // Write the target ref.
@@ -213,24 +225,13 @@ impl Rebase for Merge {
     }
 }
 
-/// Settle a merge outcome's conflicts the way git would.
+/// Take agreed identical additions into the outcome tree.
 ///
-/// gix-merge lists even auto-resolved entries in `conflicts`, so an
-/// emptiness check would cry wolf — judge by `is_unresolved` with
-/// git-compatible strictness instead. Identical additions on both sides
-/// (same path, mode, and blob — routine when an upper patch contains a
-/// lower patch's files verbatim) are agreed content: take them into the
-/// outcome tree. gix-merge conservatively reports those as `Err(Unknown)`
-/// while git merges them cleanly.
-///
-/// `layer` names the patch (and commit, for replays) for error messages.
-/// On unresolved conflicts this bails listing the paths; the caller must
-/// treat that as fatal before anything is pushed.
-pub(crate) fn settle_conflicts(
-    outcome: &mut gix::merge::tree::Outcome<'_>,
-    layer: &str,
-) -> Result<()> {
-    let mut actionable: Vec<String> = Vec::new();
+/// Both sides adding the same path, mode, and blob is agreed content —
+/// routine when an upper patch contains a lower patch's files verbatim.
+/// gix-merge conservatively reports those as `Err(Unknown)` while git merges
+/// them cleanly.
+pub(crate) fn take_agreed_additions(outcome: &mut gix::merge::tree::Outcome<'_>) -> Result<()> {
     for conflict in &outcome.conflicts {
         if let (
             TreeChange::Addition {
@@ -251,22 +252,34 @@ pub(crate) fn settle_conflicts(
             && ours_mode == theirs_mode
         {
             outcome.tree.upsert(ours_loc, ours_mode.kind(), *ours_id)?;
-        } else if conflict.is_unresolved(gix::merge::tree::TreatAsUnresolved::git()) {
-            actionable.push(conflict.ours.location().to_string());
         }
     }
-    if !actionable.is_empty() {
-        actionable.sort();
-        actionable.dedup();
-        anyhow::bail!(
-            "conflicts detected while merging patch `{layer}` at {} path(s): {}. \
-             Resolve on the patch branch (never on the synthesized output) and re-run; \
-             nothing was pushed",
-            actionable.len(),
-            actionable.join(", ")
-        );
-    }
     Ok(())
+}
+
+/// Paths still unresolved under git-compatible strictness.
+pub(crate) fn unresolved_paths(outcome: &gix::merge::tree::Outcome<'_>) -> Vec<String> {
+    let mut paths: Vec<String> = outcome
+        .conflicts
+        .iter()
+        .filter(|c| c.is_unresolved(gix::merge::tree::TreatAsUnresolved::git()))
+        .map(|c| c.ours.location().to_string())
+        .collect();
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+/// The standard conflict error: names the layer and paths, reminds that
+/// nothing was pushed.
+pub(crate) fn conflict_error(layer: &str, paths: &[String]) -> anyhow::Error {
+    anyhow::anyhow!(
+        "conflicts detected while merging patch `{layer}` at {} path(s): {}. \
+         Resolve on the patch branch (never on the synthesized output) and re-run; \
+         nothing was pushed",
+        paths.len(),
+        paths.join(", ")
+    )
 }
 
 /// Cascade-rebase strategy — placeholder for future gix rebase support.
@@ -397,7 +410,7 @@ mod tests {
         )
         .expect("set branch");
 
-        let strategy = Merge;
+        let strategy = Merge::default();
         let outcome = strategy
             .compose(
                 &repo,
@@ -439,7 +452,7 @@ mod tests {
         // Now advance the running tree to also modify a.txt differently.
         // We'll compose feature first (non-conflicting), then try another
         // branch that conflicts with the composed result.
-        let strategy_merge = Merge;
+        let strategy_merge = Merge::default();
         let _first = strategy_merge
             .compose(
                 &repo,
@@ -536,7 +549,7 @@ mod tests {
         repo.reference("refs/heads/b2", b2, PreviousValue::Any, "init b2")
             .expect("set b2");
 
-        let strategy = Merge;
+        let strategy = Merge::default();
         let outcome = strategy
             .compose(
                 &repo,
@@ -589,7 +602,7 @@ mod tests {
         repo.reference("refs/heads/l2", l2, PreviousValue::Any, "init l2")
             .expect("set l2");
 
-        let outcome = Merge
+        let outcome = Merge::default()
             .compose(
                 &repo,
                 "refs/heads/upstream/main",

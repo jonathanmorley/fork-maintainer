@@ -70,6 +70,14 @@ struct Args {
     /// Preview file writes without executing them (with --update).
     #[arg(long)]
     dry_run: bool,
+    /// Resolve conflicts with an agent program (e.g. `opencode`) instead of
+    /// failing. Requires the merge or replay strategy. The program must
+    /// exist on PATH; failures fail the run.
+    #[arg(long)]
+    resolve_with: Option<String>,
+    /// Model id passed as `--model` to the resolve-with program, when set.
+    #[arg(long)]
+    resolve_model: Option<String>,
     /// Scaffold a managed fork: create the control branch locally with
     /// caller workflows + config. Never pushes unless --push is set.
     #[arg(long)]
@@ -390,6 +398,13 @@ fn main() -> Result<()> {
         }),
         update: args.update_lock,
     };
+    let resolve =
+        args.resolve_with
+            .clone()
+            .map(|program| fork_maintainer::resolve::ResolveConfig {
+                program,
+                model: args.resolve_model.clone(),
+            });
 
     let out = synthesize_with_urls(
         &repo,
@@ -403,6 +418,7 @@ fn main() -> Result<()> {
         &cfg.output.branch,
         cfg.strategy,
         &lock,
+        resolve,
         committer()?,
     )?;
 
@@ -438,6 +454,8 @@ mod tests {
             update_lock: false,
             update: false,
             dry_run: false,
+            resolve_with: None,
+            resolve_model: None,
             init: false,
             upstream: None,
             fork: None,

@@ -19,8 +19,6 @@
 use anyhow::{Context, Result};
 use gix::{Repository, actor::SignatureRef};
 
-use crate::engine::rebase::settle_conflicts;
-
 /// Outcome of a replay pass over all patch layers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplayOutcome {
@@ -91,7 +89,8 @@ fn replay_one(
     original: gix::ObjectId,
     layer: &str,
     committer: SignatureRef<'_>,
-) -> Result<Option<(gix::ObjectId, gix::ObjectId)>> {
+    resolve: Option<&crate::resolve::ResolveConfig>,
+) -> Result<Option<(gix::ObjectId, gix::ObjectId, bool)>> {
     let commit = repo.find_commit(original)?;
     let parent_tree = match commit.parent_ids().next() {
         Some(parent) => repo.find_commit(parent)?.tree_id()?.detach(),
@@ -112,33 +111,46 @@ fn replay_one(
     let mut outcome = repo
         .merge_trees(parent_tree, running_tree, commit_tree, labels, options)
         .with_context(|| format!("replay commit {original} from `{layer}`"))?;
-    settle_conflicts(&mut outcome, &format!("{layer}@{original}"))?;
+    let agent_used = crate::resolve::settle_or_resolve(
+        &mut outcome,
+        &format!("{layer}@{original}"),
+        repo,
+        resolve,
+    )?;
     let merged_tree = outcome.tree.write()?.detach();
 
     let author = commit.author()?;
     let author = format!("{} <{}> {}", author.name, author.email, author.time);
     let author_sig =
         SignatureRef::from_bytes(author.as_bytes()).context("round-trip original author")?;
-    let message = format!(
+    let mut message = format!(
         "{}\n\nSynthesized-from: {original}",
         commit.message_raw()?.to_string().trim_end()
     );
+    if agent_used {
+        message.push_str(&format!(
+            "\nResolved-by: {}",
+            resolve.map(|r| r.program.clone()).unwrap_or_default()
+        ));
+    }
     let new_head = repo
         .new_commit_as(committer, author_sig, message, merged_tree, [running_oid])?
         .id;
-    Ok(Some((new_head, merged_tree)))
+    Ok(Some((new_head, merged_tree, agent_used)))
 }
 
 /// Replay every patch layer's unique commits onto the base.
 ///
 /// `base_ref` is the freshly fetched base; `branches` are ordered local refs.
 /// `target_ref` advances to the final head. Pure git against the local repo.
+/// Pass `resolve` to settle unresolved commits via agent instead of failing.
 pub fn replay(
     repo: &Repository,
     base_ref: &str,
     branches: &[String],
     target_ref: &str,
     committer: SignatureRef<'_>,
+    resolve: Option<&crate::resolve::ResolveConfig>,
 ) -> Result<ReplayOutcome> {
     let base_oid = repo.find_reference(base_ref)?.id().detach();
     let base_commit = repo.find_commit(base_oid)?;
@@ -156,8 +168,16 @@ pub fn replay(
             continue;
         }
         for original in unique {
-            match replay_one(repo, running_oid, running_tree, original, branch, committer)? {
-                Some((head, tree)) => {
+            match replay_one(
+                repo,
+                running_oid,
+                running_tree,
+                original,
+                branch,
+                committer,
+                resolve,
+            )? {
+                Some((head, tree, _)) => {
                     running_oid = head;
                     running_tree = tree;
                     commits_replayed += 1;
@@ -300,6 +320,7 @@ mod tests {
             &["refs/heads/feature".into()],
             "refs/heads/out",
             sig(),
+            None,
         )
         .expect("replay");
 
@@ -343,6 +364,7 @@ mod tests {
             &["refs/heads/feature".into()],
             "refs/heads/out",
             sig(),
+            None,
         )
         .expect("replay");
 
@@ -369,6 +391,7 @@ mod tests {
             &["refs/heads/feature".into()],
             "refs/heads/out",
             sig(),
+            None,
         )
         .expect("replay");
 
@@ -418,6 +441,7 @@ mod tests {
             &["refs/heads/feature".into()],
             "refs/heads/out",
             sig(),
+            None,
         )
         .expect_err("merge commit must fail");
         assert!(err.to_string().contains("linear-only"), "got: {err}");
@@ -445,6 +469,7 @@ mod tests {
             &["refs/heads/layer1".into(), "refs/heads/layer2".into()],
             "refs/heads/out",
             sig(),
+            None,
         )
         .expect_err("overlap must fail");
         let msg = format!("{err:#}");

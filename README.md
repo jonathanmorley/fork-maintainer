@@ -57,6 +57,28 @@ Each run, in an ephemeral runner with no persistent state:
   silently drop overlapping changes. Availability over correctness — declare
   it consciously.
 
+## Agent-assisted resolution (opt-in)
+
+`--resolve-with <program>` (e.g. `opencode`, `opencode2` for v2) turns a
+would-be conflict failure into an agent task instead. Requires the `merge`
+or `replay` strategy; `--resolve-model <id>` is passed through as
+`--model`. For each unresolved layer the harness materializes
+`ancestor/`, `ours/`, `theirs/` plus a `TASK.md` into a scratch directory,
+runs `<program> run [--model <id>]` there non-interactively, and reads
+merged results back from `resolved/`.
+
+Rules that keep this honest: binary paths fail without invoking anything;
+a missing resolved file fails the run; agent failure fails the run. The
+transcript is logged and the commit records `Resolved-by:` — resolutions
+are attributed, never silent. There is no verification beyond that: the
+tool cannot prove a merge correct, so review the pushed result. Fail-closed
+remains the default for a reason.
+
+In CI the agent needs credentials (e.g. `ANTHROPIC_API_KEY` as a secret —
+it flows through automatically) and a binary: the action installs the
+opencode CLI when `resolve-with` is set. Set a job `timeout-minutes`:
+agent runs are the one place this tool can hang.
+
 ## Tokens and permissions
 
 - The calling job must grant `contents: write` (plus `id-token: write` when
