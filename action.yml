@@ -207,11 +207,18 @@ runs:
         if [ "${{ inputs.update-lock }}" = "true" ]; then
           LOCK_ARGS="$LOCK_ARGS --update-lock"
         fi
+        RESOLVE_ARGS=""
+        if [ -n "${{ inputs.resolve-with }}" ]; then
+          RESOLVE_ARGS="--resolve-with ${{ inputs.resolve-with }}"
+        fi
+        if [ -n "${{ inputs.resolve-model }}" ]; then
+          RESOLVE_ARGS="$RESOLVE_ARGS --resolve-model ${{ inputs.resolve-model }}"
+        fi
         # shellcheck disable=SC2086
         SYNTH_OUT=$(./engine/target/release/synthesize \
           $SOURCE_ARGS \
           --strategy "${{ inputs.strategy }}" \
-          $LOCK_ARGS 2>&1 | tee /dev/stderr)
+          $LOCK_ARGS $RESOLVE_ARGS 2>&1 | tee /dev/stderr)
         LAST_LINE=$(printf '%s\n' "$SYNTH_OUT" | grep -E '^(pushed |no change: )' | tail -n 1)
         case "$LAST_LINE" in
           pushed\ *)
