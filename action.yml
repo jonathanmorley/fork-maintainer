@@ -198,17 +198,27 @@ runs:
         if [ -n "${{ inputs.config }}" ]; then
           SOURCE_ARGS="--config ${{ inputs.config }}"
         else
-          SOURCE_ARGS="--base \"${{ inputs.base }}\" $PATCH_ARGS --output \"${{ inputs.output }}\""
+          # Unquoted deliberately: this string is re-split on use below, so
+          # embedded quotes would become literal characters in the values.
+          # Refs never contain whitespace, making word splitting safe.
+          SOURCE_ARGS="--base ${{ inputs.base }} $PATCH_ARGS --output ${{ inputs.output }}"
         fi
         LOCK_ARGS="--lockfile ${{ inputs.lockfile }}"
         if [ "${{ inputs.update-lock }}" = "true" ]; then
           LOCK_ARGS="$LOCK_ARGS --update-lock"
         fi
+        RESOLVE_ARGS=""
+        if [ -n "${{ inputs.resolve-with }}" ]; then
+          RESOLVE_ARGS="--resolve-with ${{ inputs.resolve-with }}"
+        fi
+        if [ -n "${{ inputs.resolve-model }}" ]; then
+          RESOLVE_ARGS="$RESOLVE_ARGS --resolve-model ${{ inputs.resolve-model }}"
+        fi
         # shellcheck disable=SC2086
         SYNTH_OUT=$(./engine/target/release/synthesize \
           $SOURCE_ARGS \
           --strategy "${{ inputs.strategy }}" \
-          $LOCK_ARGS 2>&1 | tee /dev/stderr)
+          $LOCK_ARGS $RESOLVE_ARGS 2>&1 | tee /dev/stderr)
         LAST_LINE=$(printf '%s\n' "$SYNTH_OUT" | grep -E '^(pushed |no change: )' | tail -n 1)
         case "$LAST_LINE" in
           pushed\ *)
