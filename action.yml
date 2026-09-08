@@ -35,8 +35,8 @@
 #              per line, applied top-to-bottom. Blank lines and lines starting
 #              with `#` are ignored. Patches may live in ANY readable repo.
 #   output     (required) destination in `owner/name@branch` form.
-#   strategy   (optional) `merge` (default), `overlay`, or `replay`;
-#              passed straight through to `synthesize --strategy`.
+#   strategy   (optional) `merge`, `overlay`, or `replay`. Overrides the
+#              config file when set; empty (default) means use the file's.
 #   engine-ref (optional) ref of jonathanmorley/fork-maintainer to build the
 #              engine binary from. Default `main`.
 #   sts-scope / sts-identity (optional) mint a short-lived token in-job via
@@ -84,9 +84,9 @@ inputs:
     required: false
     default: ""
   strategy:
-    description: "Synthesize strategy: merge, overlay, or replay"
+    description: "Synthesize strategy: merge, overlay, or replay. Overrides the config file when set; empty means use the file's value."
     required: false
-    default: "merge"
+    default: ""
   engine-ref:
     description: "Ref of jonathanmorley/fork-maintainer to build the engine binary from"
     required: false
@@ -214,10 +214,14 @@ runs:
         if [ -n "${{ inputs.resolve-model }}" ]; then
           RESOLVE_ARGS="$RESOLVE_ARGS --resolve-model ${{ inputs.resolve-model }}"
         fi
+        STRATEGY_ARGS=""
+        if [ -n "${{ inputs.strategy }}" ]; then
+          STRATEGY_ARGS="--strategy ${{ inputs.strategy }}"
+        fi
         # shellcheck disable=SC2086
         SYNTH_OUT=$(./engine/target/release/synthesize \
           $SOURCE_ARGS \
-          --strategy "${{ inputs.strategy }}" \
+          $STRATEGY_ARGS \
           $LOCK_ARGS $RESOLVE_ARGS 2>&1 | tee /dev/stderr)
         LAST_LINE=$(printf '%s\n' "$SYNTH_OUT" | grep -E '^(pushed |no change: )' | tail -n 1)
         case "$LAST_LINE" in
