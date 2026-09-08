@@ -183,15 +183,14 @@ jobs:
     );
     let config = SynthesisConfig {
         base: base.clone(),
-        patches: std::iter::once(PatchSpec {
-            branch: control.clone(),
-            pin: false,
-        })
-        .chain(patches.iter().map(|p| PatchSpec {
-            branch: p.branch.clone(),
-            pin: true,
-        }))
-        .collect(),
+        patches: patches
+            .iter()
+            .map(|p| PatchSpec {
+                branch: p.branch.clone(),
+                pin: true,
+            })
+            .collect(),
+        overlay: vec![control.clone()],
         output,
         strategy: Strategy::Merge,
     };
@@ -498,12 +497,13 @@ mod tests {
             .expect("config");
         let cfg: SynthesisConfig =
             serde_json::from_str(config_raw).expect("generated config parses");
-        // Control branch leads unpinned; discovered patch pinned.
-        assert_eq!(cfg.patches.len(), 2);
-        assert_eq!(cfg.patches[0].branch.branch, "fork-owned");
-        assert!(!cfg.patches[0].pin);
-        assert_eq!(cfg.patches[1].branch.branch, "feat");
-        assert!(cfg.patches[1].pin);
+        // Control branch leads the overlay list; the discovered patch is
+        // the only merge layer, pinned.
+        assert_eq!(cfg.patches.len(), 1);
+        assert_eq!(cfg.patches[0].branch.branch, "feat");
+        assert!(cfg.patches[0].pin);
+        assert_eq!(cfg.overlay.len(), 1);
+        assert_eq!(cfg.overlay[0].branch, "fork-owned");
 
         let caller = files
             .iter()
@@ -616,11 +616,12 @@ mod tests {
         let shown = git(&work, &["show", "--name-only", "--format=", "fork-owned"]).expect("show");
         assert!(shown.contains("synthesis.json"), "got: {shown}");
 
-        // The generated config parses with the control branch first.
+        // The generated config parses with the control branch overlaying.
         let raw = std::fs::read_to_string(work.join("synthesis.json")).expect("read");
         let cfg: SynthesisConfig = serde_json::from_str(&raw).expect("parses");
-        assert_eq!(cfg.patches.len(), 1);
-        assert!(!cfg.patches[0].pin);
+        assert!(cfg.patches.is_empty(), "no PRs offline");
+        assert_eq!(cfg.overlay.len(), 1);
+        assert_eq!(cfg.overlay[0].branch, "fork-owned");
 
         // Next steps render.
         assert!(report.next_steps(&opts.fork).contains("fork-owned"));

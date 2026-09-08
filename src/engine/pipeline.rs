@@ -133,6 +133,7 @@ pub fn synthesize(
     repo: &Repository,
     base: &BranchRef,
     patches: &[PatchSpec],
+    overlay: &[BranchRef],
     output: &BranchRef,
     strategy: Strategy,
     lock: &crate::lockfile::LockOptions,
@@ -146,6 +147,10 @@ pub fn synthesize(
         &patches
             .iter()
             .map(|p| (p.clone(), p.branch.repo.https_url()))
+            .collect::<Vec<_>>(),
+        &overlay
+            .iter()
+            .map(|o| (o.clone(), o.repo.https_url()))
             .collect::<Vec<_>>(),
         &output.repo.https_url(),
         &output.branch,
@@ -171,6 +176,7 @@ pub fn synthesize_with_urls(
     base_url: &str,
     base_branch: &str,
     patches: &[(PatchSpec, String)],
+    overlay: &[(BranchRef, String)],
     output_url: &str,
     output_branch: &str,
     strategy: Strategy,
@@ -195,6 +201,14 @@ pub fn synthesize_with_urls(
         if spec.pin {
             resolved.push((spec.branch.clone(), oid));
         }
+    }
+    // 1b. Fetch overlay branches (control plane, never locked).
+    let mut overlay_refs = Vec::with_capacity(overlay.len());
+    for (i, (branch, url)) in overlay.iter().enumerate() {
+        let local = format!("refs/synthesis/overlay-{i}");
+        let oid = fetch_branch(repo, url, &branch.branch, &local)?;
+        tracing::info!(overlay = %branch, tip = %oid, "fetched overlay");
+        overlay_refs.push(local);
     }
 
     // 1b. Pin patches: enforce (or bootstrap/update) the lockfile before
@@ -257,7 +271,56 @@ pub fn synthesize_with_urls(
         }
     };
 
-    // 3. Skip the push when the published tip already carries this tree.
+    // 3. Overlay the control plane, if any. Applied blind on top of the
+    // composed tree as its own commit (skipped when it changes nothing),
+    // after a collision check that fails loudly instead of clobbering.
+    let (mut tree, mut commit) = (tree, commit);
+    if !overlay_refs.is_empty() {
+        let base_tree = ref_tree(repo, BASE_REF).context("read base tree")?;
+        let mut patch_trees = Vec::with_capacity(patch_refs.len());
+        for r in &patch_refs {
+            patch_trees.push(ref_tree(repo, r).with_context(|| format!("read {r}"))?);
+        }
+        let mut overlay_trees = Vec::with_capacity(overlay_refs.len());
+        for r in &overlay_refs {
+            overlay_trees.push(ref_tree(repo, r).with_context(|| format!("read {r}"))?);
+        }
+        let overlay_map = crate::engine::overlay::check_collisions(
+            repo,
+            base_tree,
+            &patch_trees,
+            &overlay_trees,
+        )?;
+        let overlaid = crate::engine::overlay::apply(repo, tree, &overlay_map)?;
+        if overlaid != tree {
+            commit = repo
+                .new_commit_as(
+                    committer,
+                    committer,
+                    "overlay control plane (managed files)",
+                    overlaid,
+                    [commit],
+                )?
+                .id;
+            tree = overlaid;
+            tracing::info!("applied control-plane overlay");
+        }
+        repo.edit_reference(gix::refs::transaction::RefEdit {
+            change: gix::refs::transaction::Change::Update {
+                log: gix::refs::transaction::LogChange {
+                    mode: gix::refs::transaction::RefLog::AndReference,
+                    force_create_reflog: false,
+                    message: format!("synthesize: overlay to {commit}").into(),
+                },
+                expected: gix::refs::transaction::PreviousValue::Any,
+                new: gix::refs::Target::Object(commit),
+            },
+            name: gix::refs::FullName::try_from(OUTPUT_REF)?,
+            deref: false,
+        })?;
+    }
+
+    // 4. Skip the push when the published tip already carries this tree.
     if let Some(_prev) = fetch_prev_output(repo, output_url, output_branch)?
         && ref_tree(repo, PREV_OUTPUT_REF).as_ref() == Some(&tree)
     {
@@ -269,7 +332,7 @@ pub fn synthesize_with_urls(
         });
     }
 
-    // 4. Force-push the synthesized output branch.
+    // 5. Force-push the synthesized output branch.
     let repo_path = repo.workdir().unwrap_or_else(|| repo.common_dir());
     push_output(repo_path, output_url, OUTPUT_REF, output_branch, None)
         .with_context(|| format!("push output branch `{output_branch}` to `{output_url}`"))?;
@@ -375,6 +438,20 @@ mod tests {
         patch_src(owner, name, url, branch, true)
     }
 
+    /// Overlay source for tests: identity plus transport URL.
+    fn overlay_src(owner: &str, name: &str, url: String, branch: &str) -> (BranchRef, String) {
+        (
+            BranchRef {
+                repo: crate::config::Repo {
+                    owner: owner.into(),
+                    name: name.into(),
+                },
+                branch: branch.into(),
+            },
+            url,
+        )
+    }
+
     /// Locking disabled (legacy auto-follow) for tests not exercising pins.
     fn no_lock() -> crate::lockfile::LockOptions {
         crate::lockfile::LockOptions {
@@ -416,6 +493,7 @@ mod tests {
             &url(&upstream_dir),
             "main",
             &[pinned("other", "repo", url(&patch_dir), "feature")],
+            &[],
             &url(&output_dir),
             "main",
             Strategy::Merge,
@@ -461,6 +539,7 @@ mod tests {
                 &scratch,
                 &url(&upstream_dir),
                 "main",
+                &[],
                 &[],
                 &url(&output_dir),
                 "main",
@@ -524,6 +603,7 @@ mod tests {
                 pinned("a-org", "repo", url(&repo_a_dir), "a"),
                 pinned("b-org", "repo", url(&repo_b_dir), "b"),
             ],
+            &[],
             &url(&output_dir),
             "main",
             Strategy::Merge,
@@ -566,6 +646,7 @@ mod tests {
             &url(&upstream_dir),
             "main",
             &[pinned("up", "repo", url(&upstream_dir), "nope")],
+            &[],
             &url(&output_dir),
             "main",
             Strategy::Overlay,
@@ -619,6 +700,7 @@ mod tests {
             &url(&upstream_dir),
             "main",
             &[pinned("other", "repo", url(&patch_dir), "feature")],
+            &[],
             &url(&output_dir),
             "main",
             Strategy::Merge,
@@ -701,6 +783,7 @@ mod tests {
                 pinned("sim", "repo", url(&remote_dir), "patch-a"),
                 pinned("sim", "repo", url(&remote_dir), "patch-b"),
             ],
+            &[],
             &url(&output_dir),
             "main",
             Strategy::Merge,
@@ -760,6 +843,7 @@ mod tests {
                 &url(&upstream_dir),
                 "main",
                 &[pinned("rpatch", "repo", url(&patch_dir), "feature")],
+                &[],
                 &url(&output_dir),
                 "main",
                 Strategy::Replay,
@@ -826,6 +910,7 @@ mod tests {
                 &url(&upstream_dir),
                 "main",
                 &[pinned("lp", "repo", url(&patch_dir), "feature")],
+                &[],
                 &url(&output_dir),
                 "main",
                 Strategy::Overlay,
@@ -914,6 +999,7 @@ mod tests {
                 &url(&upstream_dir),
                 "main",
                 &[patch_src("up", "repo", url(&patch_dir), "feature", false)],
+                &[],
                 &url(&output_dir),
                 "main",
                 Strategy::Overlay,
@@ -944,5 +1030,67 @@ mod tests {
             second.tree, first.tree,
             "new patch content flows into the output"
         );
+    }
+
+    /// Control overlay lands in the output as its own commit on top.
+    #[test]
+    fn overlay_applies_as_own_commit() {
+        let upstream_dir = temp_dir("ov_up");
+        let upstream = gix::init_bare(&upstream_dir).expect("init upstream");
+        let base = commit_with_files(&upstream, &[("a.txt", "a1")], "base", None);
+        set_ref(&upstream, "refs/heads/main", base);
+
+        // Patch adds an unrelated file (root commit: self-contained objects,
+        // as cross-repo patch branches are in production).
+        let patch_dir = temp_dir("ov_patch");
+        let patch_repo = gix::init_bare(&patch_dir).expect("init patch repo");
+        let p = commit_with_files(
+            &patch_repo,
+            &[("a.txt", "a1"), ("f.txt", "f")],
+            "feat",
+            None,
+        );
+        set_ref(&patch_repo, "refs/heads/feature", p);
+
+        // Overlay carries one managed file nothing else touches.
+        let over_dir = temp_dir("ov_over");
+        let over_repo = gix::init_bare(&over_dir).expect("init overlay repo");
+        let o = commit_with_files(&over_repo, &[("managed.yml", "m")], "managed", None);
+        set_ref(&over_repo, "refs/heads/owned", o);
+
+        let output_dir = temp_dir("ov_out");
+        let _output = gix::init_bare(&output_dir).expect("init output");
+
+        let scratch_dir = temp_dir("ov_scratch");
+        let scratch = gix::init_bare(&scratch_dir).expect("init scratch");
+        let out = synthesize_with_urls(
+            &scratch,
+            &url(&upstream_dir),
+            "main",
+            &[pinned("o", "r", url(&patch_dir), "feature")],
+            &[overlay_src("o", "r", url(&over_dir), "owned")],
+            &url(&output_dir),
+            "main",
+            Strategy::Overlay,
+            &no_lock(),
+            None,
+            sig(),
+        )
+        .expect("synthesize with overlay");
+
+        assert!(out.pushed);
+        assert_eq!(
+            tree_blob(&scratch, out.tree, "managed.yml").as_deref(),
+            Some("m")
+        );
+        assert_eq!(tree_blob(&scratch, out.tree, "f.txt").as_deref(), Some("f"));
+
+        // The overlay is its own commit on top of the composed one.
+        let output = gix::open(&output_dir).expect("open output");
+        let tip = ref_id(&output, "refs/heads/main").expect("tip");
+        let head = output.find_commit(tip).expect("head");
+        let msg = head.message_raw().expect("msg").to_string();
+        assert!(msg.contains("overlay control plane"), "got: {msg}");
+        assert_eq!(tip, out.commit);
     }
 }
