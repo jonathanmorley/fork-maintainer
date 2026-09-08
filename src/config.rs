@@ -183,6 +183,14 @@ pub struct SynthesisConfig {
     /// Ordered patch layers, applied bottom-first onto the base.
     #[serde(default)]
     pub patches: Vec<PatchSpec>,
+    /// Control-plane branches, applied blindly on top of the composed tree
+    /// in order (last wins). These carry managed files (caller workflows,
+    /// config, trust policy) that must exist verbatim in the output — never
+    /// merged, so they can never conflict. A control path colliding with
+    /// base or patch content fails the run instead of clobbering silently.
+    /// Never locked, never recorded.
+    #[serde(default)]
+    pub overlay: Vec<BranchRef>,
     /// Where the synthesized commit is force-pushed.
     pub output: BranchRef,
     /// Composition strategy. Defaults to `merge`.

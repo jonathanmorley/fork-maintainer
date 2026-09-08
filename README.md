@@ -46,8 +46,8 @@ Each run, in an ephemeral runner with no persistent state:
 ## Rules
 
 - **The output branch is generated.** Never commit to it directly; every run
-  rebuilds and force-pushes it. All persistent content lives in the base or
-  a patch branch.
+  rebuilds and force-pushes it. All persistent content lives in the base, a
+  patch branch, or the control overlay.
 - **Conflicts fail loudly.** A conflicting patch fails the run *before*
   anything is pushed, naming the patch layer and the conflicted paths.
   Resolve on the patch branch (merge the base tip into it, or restack
@@ -56,6 +56,20 @@ Each run, in an ephemeral runner with no persistent state:
 - **One escape hatch.** `--strategy overlay` never fails on conflicts but can
   silently drop overlapping changes. Availability over correctness — declare
   it consciously.
+
+## Control overlay
+
+The `overlay` list (typically a single `fork-owned` control branch) carries
+files that must exist verbatim in the output: caller workflows, config,
+trust policy. They apply blind on top of the composed tree as their own
+`overlay control plane` commit — never merged, so they can never conflict.
+
+Blind does not mean unchecked: before applying, every overlay path is
+compared against the base tree and every patch tip tree. A path present
+elsewhere with different content fails the run naming the collision
+(identical content passes quietly). Managed files can never silently
+clobber release code, and release code can never silently drop managed
+files. Overlay branches are never locked and never recorded.
 
 ## Agent-assisted resolution (opt-in)
 

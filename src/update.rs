@@ -541,6 +541,7 @@ mod tests {
         let cfg = SynthesisConfig {
             base: bref("up", "r", "main"),
             patches: vec![pspec("o", "r", "gone"), pspec("o", "r", "kept")],
+            overlay: vec![],
             output: bref("o", "r", "main"),
             strategy: crate::config::Strategy::Merge,
         };
@@ -578,6 +579,7 @@ mod tests {
         let cfg = SynthesisConfig {
             base: bref("up", "r", "main"),
             patches: vec![pspec("o", "r", "gone")],
+            overlay: vec![],
             output: bref("o", "r", "main"),
             strategy: crate::config::Strategy::Merge,
         };

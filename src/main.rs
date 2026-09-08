@@ -165,6 +165,7 @@ fn load_config(args: &Args) -> Result<SynthesisConfig> {
                     .context("--base is required without --config")?,
             )?,
             patches: vec![],
+            overlay: vec![],
             output: BranchRef::parse_compact(
                 args.output
                     .as_deref()
@@ -425,6 +426,10 @@ fn run() -> Result<()> {
         &cfg.patches
             .iter()
             .map(|p| (p.clone(), with_auth(&p.branch.repo.https_url())))
+            .collect::<Vec<_>>(),
+        &cfg.overlay
+            .iter()
+            .map(|o| (o.clone(), with_auth(&o.repo.https_url())))
             .collect::<Vec<_>>(),
         &with_auth(&cfg.output.repo.https_url()),
         &cfg.output.branch,

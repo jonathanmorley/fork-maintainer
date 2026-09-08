@@ -5,6 +5,7 @@
 //! local bare repositories with no network.
 
 pub mod fetch;
+pub mod overlay;
 pub mod pipeline;
 pub mod push;
 pub mod rebase;
