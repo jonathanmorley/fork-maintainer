@@ -48,10 +48,9 @@ pub fn fetch_upstream(
     track_ref: &str, // e.g. "refs/remotes/upstream/main"
 ) -> Result<FetchedTip> {
     let full_remote_ref = format!("refs/heads/{branch}");
+    let safe_url = crate::engine::redact_url(upstream_url);
     let oid = fetch_ref(repo, upstream_url, &full_remote_ref, track_ref)?.ok_or_else(|| {
-        anyhow::anyhow!(
-            "upstream did not advertise branch `{branch}` (fetched via `{upstream_url}`)"
-        )
+        anyhow::anyhow!("upstream did not advertise branch `{branch}` (fetched via `{safe_url}`)")
     })?;
     Ok(FetchedTip { oid })
 }

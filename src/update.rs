@@ -135,7 +135,10 @@ pub fn resolve_tip(url: &str, branch: &str) -> Result<Option<gix::ObjectId>> {
         .context("failed to execute git ls-remote")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("git ls-remote failed for branch `{branch}` at `{url}`: {stderr}");
+        anyhow::bail!(
+            "git ls-remote failed for branch `{branch}` at `{}`: {stderr}",
+            crate::engine::redact_url(url)
+        );
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
     for line in stdout.lines() {

@@ -364,7 +364,19 @@ fn scratch_dir(workdir: Option<PathBuf>) -> Result<PathBuf> {
     Ok(dir)
 }
 
-fn main() -> Result<()> {
+fn main() {
+    if let Err(err) = run() {
+        // Last line of defense: transports echo URLs (credentials included)
+        // in errors we never formatted. Scrub before printing.
+        eprintln!(
+            "Error: {:#}",
+            fork_maintainer::engine::redact_text(&format!("{err:#}"))
+        );
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<()> {
     tracing_subscriber::fmt().with_target(false).init();
     let args = Args::parse();
 
