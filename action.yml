@@ -198,7 +198,10 @@ runs:
         if [ -n "${{ inputs.config }}" ]; then
           SOURCE_ARGS="--config ${{ inputs.config }}"
         else
-          SOURCE_ARGS="--base \"${{ inputs.base }}\" $PATCH_ARGS --output \"${{ inputs.output }}\""
+          # Unquoted deliberately: this string is re-split on use below, so
+          # embedded quotes would become literal characters in the values.
+          # Refs never contain whitespace, making word splitting safe.
+          SOURCE_ARGS="--base ${{ inputs.base }} $PATCH_ARGS --output ${{ inputs.output }}"
         fi
         LOCK_ARGS="--lockfile ${{ inputs.lockfile }}"
         if [ "${{ inputs.update-lock }}" = "true" ]; then
