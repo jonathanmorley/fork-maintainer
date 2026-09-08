@@ -71,6 +71,18 @@ elsewhere with different content fails the run naming the collision
 clobber release code, and release code can never silently drop managed
 files. Overlay branches are never locked and never recorded.
 
+> **Bootstrapping caveat.** STS trust policies (e.g. Octo-STS
+> `.github/chainguard/*.sts.yaml`) are read from the scope repo's *default
+> branch* — which, in this setup, is the generated output branch. If the
+> control plane is ever absent from composition (no `patches` entry *and* no
+> `overlay` entry), one push drops the trust policy from the default branch
+> and every subsequent run fails at token exchange with `unable to find trust
+> policy` — a deadlock synthesis cannot heal itself, since it can no longer
+> authenticate to push. Recovery is a one-file break-glass push of the trust
+> policy straight to the output branch (user credentials, not STS); the next
+> run's overlay then converges the rest. Never ship a config with the control
+> branch in neither list.
+
 ## Agent-assisted resolution (opt-in)
 
 `--resolve-with <program>` (e.g. `opencode`, `opencode2` for v2) turns a
