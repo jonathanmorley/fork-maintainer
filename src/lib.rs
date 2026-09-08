@@ -12,4 +12,5 @@ pub mod config;
 pub mod engine;
 pub mod init;
 pub mod lockfile;
+pub mod resolve;
 pub mod update;

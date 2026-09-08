@@ -112,6 +112,14 @@ inputs:
     required: false
     default: false
     type: boolean
+  resolve-with:
+    description: "Agent program resolving conflicts instead of failing (e.g. opencode, opencode2). Requires merge or replay strategy. Fail-closed stays default when empty."
+    required: false
+    default: ""
+  resolve-model:
+    description: "Model id passed as --model to the resolve-with program, when set."
+    required: false
+    default: ""
 
 outputs:
   pushed:
@@ -133,6 +141,14 @@ runs:
 
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+
+    - name: Install agent CLI for conflict resolution
+      if: inputs.resolve-with != ''
+      shell: bash
+      # opencode's installer drops the binary onto PATH. Pinned indirectly:
+      # the installer always fetches latest, so pin by re-pinning this step
+      # if reproducibility ever matters more than freshness.
+      run: curl -fsSL https://opencode.ai/install | bash
 
     - name: Cache Rust dependencies
       uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2

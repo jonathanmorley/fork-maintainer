@@ -51,15 +51,19 @@ pub struct SynthesizeOutcome {
 ///
 /// [`Strategy::Replay`] has no single-commit implementation — the pipeline
 /// dispatches it to [`crate::engine::replay::replay`] before calling here —
-/// so requesting it is an internal error.
+/// so requesting it is an internal error. `resolve` configures agent
+/// resolution on the merge strategy.
 ///
 /// # Errors
 ///
 /// Returns an error for [`Strategy::Replay`].
-fn strategy_impl(strategy: Strategy) -> Result<Box<dyn Rebase>> {
+fn strategy_impl(
+    strategy: Strategy,
+    resolve: Option<crate::resolve::ResolveConfig>,
+) -> Result<Box<dyn Rebase>> {
     match strategy {
         Strategy::Overlay => Ok(Box::new(Overlay)),
-        Strategy::Merge => Ok(Box::new(Merge)),
+        Strategy::Merge => Ok(Box::new(Merge { resolve })),
         Strategy::Replay => anyhow::bail!("internal error: replay is not a Rebase strategy"),
     }
 }
@@ -114,6 +118,7 @@ fn ref_tree(repo: &Repository, r: &str) -> Option<gix::ObjectId> {
 /// `repo` is an ephemeral bare repository (fresh per run is fine).
 /// `base` selects the base branch, `patches` the ordered layers, `output`
 /// the branch to advance. URLs embed authentication when required.
+#[allow(clippy::too_many_arguments)]
 pub fn synthesize(
     repo: &Repository,
     base: &BranchRef,
@@ -121,6 +126,7 @@ pub fn synthesize(
     output: &BranchRef,
     strategy: Strategy,
     lock: &crate::lockfile::LockOptions,
+    resolve: Option<crate::resolve::ResolveConfig>,
     committer: SignatureRef<'_>,
 ) -> Result<SynthesizeOutcome> {
     synthesize_with_urls(
@@ -135,6 +141,7 @@ pub fn synthesize(
         &output.branch,
         strategy,
         lock,
+        resolve,
         committer,
     )
 }
@@ -158,6 +165,7 @@ pub fn synthesize_with_urls(
     output_branch: &str,
     strategy: Strategy,
     lock: &crate::lockfile::LockOptions,
+    resolve: Option<crate::resolve::ResolveConfig>,
     committer: SignatureRef<'_>,
 ) -> Result<SynthesizeOutcome> {
     // 1. Fetch the base and every patch branch into local refs.
@@ -182,16 +190,32 @@ pub fn synthesize_with_urls(
 
     // 2. Compose the output from base + patches in order. Replay preserves
     // each unique commit; overlay/merge squash each layer into one commit.
+    // Agent resolution needs real merges: overlay never conflicts, so
+    // combining it with resolve-with is a user error, caught here.
+    if resolve.is_some() {
+        match strategy {
+            Strategy::Merge | Strategy::Replay => {}
+            Strategy::Overlay => anyhow::bail!(
+                "--resolve-with needs the merge or replay strategy (overlay never conflicts)"
+            ),
+        }
+    }
     let (tree, commit, patches_applied) = match strategy {
         Strategy::Replay => {
-            let out =
-                crate::engine::replay::replay(repo, BASE_REF, &patch_refs, OUTPUT_REF, committer)
-                    .with_context(|| {
-                    format!(
-                        "replay {} patch(es) onto {base_branch} from {base_url}",
-                        patches.len()
-                    )
-                })?;
+            let out = crate::engine::replay::replay(
+                repo,
+                BASE_REF,
+                &patch_refs,
+                OUTPUT_REF,
+                committer,
+                resolve.as_ref(),
+            )
+            .with_context(|| {
+                format!(
+                    "replay {} patch(es) onto {base_branch} from {base_url}",
+                    patches.len()
+                )
+            })?;
             tracing::info!(
                 replayed = out.commits_replayed,
                 skipped = out.skipped,
@@ -200,7 +224,7 @@ pub fn synthesize_with_urls(
             (out.tree, out.head, patch_refs.len())
         }
         _ => {
-            let strategy_impl = strategy_impl(strategy)?;
+            let strategy_impl = strategy_impl(strategy, resolve)?;
             let ComposeOutcome {
                 tree,
                 commit,
@@ -380,6 +404,7 @@ mod tests {
             "main",
             Strategy::Merge,
             &no_lock(),
+            None,
             sig(),
         )
         .expect("synthesize");
@@ -425,6 +450,7 @@ mod tests {
                 "main",
                 Strategy::Overlay,
                 &no_lock(),
+                None,
                 sig(),
             )
             .expect("synthesize")
@@ -486,6 +512,7 @@ mod tests {
             "main",
             Strategy::Merge,
             &no_lock(),
+            None,
             sig(),
         )
         .expect_err("conflicting patches should fail");
@@ -527,6 +554,7 @@ mod tests {
             "main",
             Strategy::Overlay,
             &no_lock(),
+            None,
             sig(),
         )
         .expect_err("missing patch should fail");
@@ -579,6 +607,7 @@ mod tests {
             "main",
             Strategy::Merge,
             &no_lock(),
+            None,
             sig(),
         )
         .expect("synthesize");
@@ -660,6 +689,7 @@ mod tests {
             "main",
             Strategy::Merge,
             &no_lock(),
+            None,
             sig(),
         )
         .expect("similar files across patches must merge cleanly");
@@ -718,6 +748,7 @@ mod tests {
                 "main",
                 Strategy::Replay,
                 &no_lock(),
+                None,
                 sig(),
             )
             .expect("synthesize")
@@ -783,6 +814,7 @@ mod tests {
                 "main",
                 Strategy::Overlay,
                 lock,
+                None,
                 sig(),
             )
         };
@@ -870,6 +902,7 @@ mod tests {
                 "main",
                 Strategy::Overlay,
                 &lock,
+                None,
                 sig(),
             )
             .expect("synthesize")
