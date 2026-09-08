@@ -1,0 +1,87 @@
+# End-to-end validation against the gh-testbed repo.
+#
+# Runs only when packaging changes (the action, its workflows, or the engine
+# it builds) — Rust-only logic is covered by unit tests, while arg plumbing,
+# inputs wiring, and runner behavior can only be proven live. The testbed
+# caller pins the action to a floating `e2e-under-test` branch *in this
+# repo* (refs must point at objects in their own repository), which this
+# workflow points at the PR head before dispatching and deletes afterwards:
+# no file edits, no restore step, nothing to race.
+#
+# Authentication uses Octo STS, not a stored PAT: the job mints a
+# short-lived token scoped to the testbed repo (trust policy versioned
+# there) for dispatching and polling. Ref juggling in this repo uses the
+# job's own GITHUB_TOKEN.
+# Concurrent PRs serialize on the concurrency group so two runs never share
+# fixture branches mid-flight.
+
+name: E2E (testbed)
+
+on:
+  pull_request:
+    paths:
+      - "action.yml"
+      - ".github/workflows/**"
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+
+concurrency:
+  group: e2e-testbed
+  cancel-in-progress: false
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - name: Mint testbed token via Octo STS
+        id: sts
+        uses: octo-sts/action@f603d3be9d8dd9871a265776e625a27b00effe05  # v1.1.1
+        with:
+          scope: jonathanmorley/gh-testbed
+          identity: provider-synth-e2e
+
+      - name: Point e2e-under-test at PR head
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          SHA="${{ github.sha }}"
+          if gh api "repos/jonathanmorley/fork-maintainer/git/refs/heads/e2e-under-test" \
+            --jq .object.sha >/dev/null 2>&1; then
+            gh api -X PATCH "repos/jonathanmorley/fork-maintainer/git/refs/heads/e2e-under-test" \
+              -f sha="$SHA" -f force=true --jq .object.sha
+          else
+            gh api -X POST repos/jonathanmorley/fork-maintainer/git/refs \
+              -f ref="refs/heads/e2e-under-test" -f sha="$SHA" --jq .object.sha
+          fi
+
+      - name: Dispatch validation run
+        id: dispatch
+        env:
+          GH_TOKEN: ${{ steps.sts.outputs.token }}
+        run: |
+          set -euo pipefail
+          sleep 20  # let GitHub register the dispatch target state
+          URL=$(gh workflow run resolve-validation.yml --repo jonathanmorley/gh-testbed --ref main 2>&1 | tail -1)
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          echo "run_id=$(basename "$URL")" >> "$GITHUB_OUTPUT"
+
+      - name: Await verdict
+        env:
+          GH_TOKEN: ${{ steps.sts.outputs.token }}
+        run: |
+          timeout 1200 gh run watch "${{ steps.dispatch.outputs.run_id }}" \
+            --repo jonathanmorley/gh-testbed --exit-status
+
+      - name: Delete e2e-under-test ref
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api -X DELETE repos/jonathanmorley/fork-maintainer/git/refs/heads/e2e-under-test \
+            --silent || true
