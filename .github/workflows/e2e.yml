@@ -3,14 +3,15 @@
 # Runs only when packaging changes (the action, its workflows, or the engine
 # it builds) — Rust-only logic is covered by unit tests, while arg plumbing,
 # inputs wiring, and runner behavior can only be proven live. The testbed
-# caller pins the action to a floating `e2e-under-test` branch, which this
+# caller pins the action to a floating `e2e-under-test` branch *in this
+# repo* (refs must point at objects in their own repository), which this
 # workflow points at the PR head before dispatching and deletes afterwards:
-# no file edits (GitHub refuses App tokens without workflows permission
-# touching workflow files — correctly), no restore step, nothing to race.
+# no file edits, no restore step, nothing to race.
 #
 # Authentication uses Octo STS, not a stored PAT: the job mints a
 # short-lived token scoped to the testbed repo (trust policy versioned
-# there). No long-lived credentials to rotate or leak.
+# there) for dispatching and polling. Ref juggling in this repo uses the
+# job's own GITHUB_TOKEN.
 # Concurrent PRs serialize on the concurrency group so two runs never share
 # fixture branches mid-flight.
 
@@ -34,6 +35,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     permissions:
+      contents: write
       id-token: write
     steps:
       - name: Mint testbed token via Octo STS
@@ -45,16 +47,16 @@ jobs:
 
       - name: Point e2e-under-test at PR head
         env:
-          GH_TOKEN: ${{ steps.sts.outputs.token }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           SHA="${{ github.sha }}"
-          if gh api "repos/jonathanmorley/gh-testbed/git/refs/heads/e2e-under-test" \
+          if gh api "repos/jonathanmorley/fork-maintainer/git/refs/heads/e2e-under-test" \
             --jq .object.sha >/dev/null 2>&1; then
-            gh api -X PATCH "repos/jonathanmorley/gh-testbed/git/refs/heads/e2e-under-test" \
+            gh api -X PATCH "repos/jonathanmorley/fork-maintainer/git/refs/heads/e2e-under-test" \
               -f sha="$SHA" -f force=true --jq .object.sha
           else
-            gh api -X POST repos/jonathanmorley/gh-testbed/git/refs \
+            gh api -X POST repos/jonathanmorley/fork-maintainer/git/refs \
               -f ref="refs/heads/e2e-under-test" -f sha="$SHA" --jq .object.sha
           fi
 
@@ -79,7 +81,7 @@ jobs:
       - name: Delete e2e-under-test ref
         if: always()
         env:
-          GH_TOKEN: ${{ steps.sts.outputs.token }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          gh api -X DELETE repos/jonathanmorley/gh-testbed/git/refs/heads/e2e-under-test \
+          gh api -X DELETE repos/jonathanmorley/fork-maintainer/git/refs/heads/e2e-under-test \
             --silent || true
