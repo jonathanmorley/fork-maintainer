@@ -3,8 +3,10 @@
 # Runs only when packaging changes (the action, its workflows, or the engine
 # it builds) — Rust-only logic is covered by unit tests, while arg plumbing,
 # inputs wiring, and runner behavior can only be proven live. The testbed
-# caller takes an engine-ref input, so the PR head is tested by dispatch
-# parameter — no file juggling, no restore step, nothing to race over.
+# caller pins the action to a floating `e2e-under-test` branch, which this
+# workflow points at the PR head before dispatching and deletes afterwards:
+# no file edits (GitHub refuses App tokens without workflows permission
+# touching workflow files — correctly), no restore step, nothing to race.
 #
 # Authentication uses Octo STS, not a stored PAT: the job mints a
 # short-lived token scoped to the testbed repo (trust policy versioned
@@ -41,6 +43,21 @@ jobs:
           scope: jonathanmorley/gh-testbed
           identity: provider-synth-e2e
 
+      - name: Point e2e-under-test at PR head
+        env:
+          GH_TOKEN: ${{ steps.sts.outputs.token }}
+        run: |
+          set -euo pipefail
+          SHA="${{ github.sha }}"
+          if gh api "repos/jonathanmorley/gh-testbed/git/refs/heads/e2e-under-test" \
+            --jq .object.sha >/dev/null 2>&1; then
+            gh api -X PATCH "repos/jonathanmorley/gh-testbed/git/refs/heads/e2e-under-test" \
+              -f sha="$SHA" -f force=true --jq .object.sha
+          else
+            gh api -X POST repos/jonathanmorley/gh-testbed/git/refs \
+              -f ref="refs/heads/e2e-under-test" -f sha="$SHA" --jq .object.sha
+          fi
+
       - name: Dispatch validation run
         id: dispatch
         env:
@@ -48,7 +65,7 @@ jobs:
         run: |
           set -euo pipefail
           sleep 20  # let GitHub register the dispatch target state
-          URL=$(gh workflow run resolve-validation.yml --repo jonathanmorley/gh-testbed --ref main -f engine-ref="${{ github.sha }}" 2>&1 | tail -1)
+          URL=$(gh workflow run resolve-validation.yml --repo jonathanmorley/gh-testbed --ref main 2>&1 | tail -1)
           echo "url=$URL" >> "$GITHUB_OUTPUT"
           echo "run_id=$(basename "$URL")" >> "$GITHUB_OUTPUT"
 
@@ -58,3 +75,11 @@ jobs:
         run: |
           timeout 1200 gh run watch "${{ steps.dispatch.outputs.run_id }}" \
             --repo jonathanmorley/gh-testbed --exit-status
+
+      - name: Delete e2e-under-test ref
+        if: always()
+        env:
+          GH_TOKEN: ${{ steps.sts.outputs.token }}
+        run: |
+          gh api -X DELETE repos/jonathanmorley/gh-testbed/git/refs/heads/e2e-under-test \
+            --silent || true
